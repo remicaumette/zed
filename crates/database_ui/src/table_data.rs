@@ -591,7 +591,7 @@ impl TableDataView {
         let mut table = Table::new(table_column_count)
             .width(px((table_column_count.max(1) * 180) as f32))
             .header(headers)
-            .striped();
+            .column_borders();
         for (row_index, row) in data.rows.iter().enumerate() {
             let mut cells = Vec::new();
             if can_edit {

@@ -39,6 +39,7 @@ in a native Zed view with staged row editing.
 - [x] Lazily list databases, tables, views, columns, and indexes through JDBC metadata.
 - [x] Open a table data tab with optional `WHERE` and `ORDER BY` fragments.
 - [x] Cycle ascending, descending, and unsorted order by selecting a result column.
+- [x] Display row and column borders so editable cells are clearly delimited.
 - [x] Edit cells inline, add rows, and stage row deletions for tables with a primary key.
 - [x] Save all staged table changes in one transaction using prepared statements.
 - [x] Keep connections and tables without a JDBC-reported primary key read-only.

@@ -356,6 +356,7 @@ impl ColumnWidthConfig {
 pub struct Table {
     striped: bool,
     show_row_borders: bool,
+    show_column_borders: bool,
     show_row_hover: bool,
     headers: Option<TableRow<AnyElement>>,
     rows: TableContents,
@@ -380,6 +381,7 @@ impl Table {
             cols,
             striped: false,
             show_row_borders: true,
+            show_column_borders: false,
             show_row_hover: true,
             headers: None,
             rows: TableContents::Vec(Vec::new()),
@@ -468,6 +470,12 @@ impl Table {
     /// Hides the border lines between rows
     pub fn hide_row_borders(mut self) -> Self {
         self.show_row_borders = false;
+        self
+    }
+
+    /// Shows a vertical separator between table columns.
+    pub fn column_borders(mut self) -> Self {
+        self.show_column_borders = true;
         self
     }
 
@@ -578,7 +586,7 @@ fn base_cell_style_text(width: Option<Length>, use_ui_font: bool, cx: &App) -> D
 }
 
 fn render_cell(width: Option<Length>, cell: AnyElement, ctx: &TableRenderContext, cx: &App) -> Div {
-    if ctx.disable_base_cell_style {
+    let cell = if ctx.disable_base_cell_style {
         div()
             .when_some(width, |this, width| this.w(width))
             .when(width.is_none(), |this| this.flex_1())
@@ -589,7 +597,10 @@ fn render_cell(width: Option<Length>, cell: AnyElement, ctx: &TableRenderContext
             .px_1()
             .py_0p5()
             .child(cell)
-    }
+    };
+    cell.when(ctx.show_column_borders, |cell| {
+        cell.border_r_1().border_color(cx.theme().colors().border)
+    })
 }
 
 fn render_header_cell(
@@ -599,6 +610,7 @@ fn render_header_cell(
     shared_element_id: &SharedString,
     resize_info: Option<&HeaderResizeInfo>,
     use_ui_font: bool,
+    show_column_borders: bool,
     cx: &App,
 ) -> Stateful<Div> {
     base_cell_style_text(width, use_ui_font, cx)
@@ -609,6 +621,9 @@ fn render_header_cell(
             shared_element_id.clone(),
             header_idx as u64,
         ))
+        .when(show_column_borders, |header| {
+            header.border_r_1().border_color(cx.theme().colors().border)
+        })
         .when_some(resize_info.cloned(), |this, info| {
             if info.resize_behavior[header_idx].is_resizable() {
                 this.on_click(move |event, window, cx| {
@@ -796,6 +811,7 @@ pub fn render_table_header(
                         &shared_element_id,
                         resize_info_ref,
                         use_ui_font,
+                        table_context.show_column_borders,
                         cx,
                     )
                 }));
@@ -809,6 +825,7 @@ pub fn render_table_header(
                     &shared_element_id,
                     resize_info_ref,
                     use_ui_font,
+                    table_context.show_column_borders,
                     cx,
                 )
             },
@@ -846,6 +863,7 @@ pub fn render_table_header(
                             &shared_element_id,
                             resize_info_ref,
                             use_ui_font,
+                            table_context.show_column_borders,
                             cx,
                         )
                     }),
@@ -858,6 +876,7 @@ pub fn render_table_header(
 pub struct TableRenderContext {
     pub striped: bool,
     pub show_row_borders: bool,
+    pub show_column_borders: bool,
     pub show_row_hover: bool,
     pub total_row_count: usize,
     pub column_widths: Option<TableRow<Length>>,
@@ -879,6 +898,7 @@ impl TableRenderContext {
         Self {
             striped: table.striped,
             show_row_borders: table.show_row_borders,
+            show_column_borders: table.show_column_borders,
             show_row_hover: table.show_row_hover,
             total_row_count: table.rows.len(),
             column_widths: table
@@ -898,6 +918,7 @@ impl TableRenderContext {
         Self {
             striped: false,
             show_row_borders: true,
+            show_column_borders: false,
             show_row_hover: true,
             total_row_count: 0,
             column_widths,
