@@ -1,13 +1,17 @@
 use crate::{ConnectionState, DatabasePanel};
 use anyhow::{Context as _, Result};
-use database::{ConnectionProfile, ConnectionProfileError, ConnectionTestResult, test_connection};
+use database::{
+    ConnectionProfile, ConnectionProfileError, ConnectionTestResult, DatabaseDriver,
+    test_connection,
+};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
     PathPromptOptions, Render, Task, WeakEntity, Window, rems,
 };
 use ui::{
-    Banner, Button, ButtonStyle, Color, Icon, IconName, Label, LabelSize, Modal, ModalFooter,
-    ModalHeader, Section, Severity, Switch, SwitchLabelPosition, ToggleState, prelude::*,
+    Banner, Button, ButtonStyle, Color, ContextMenu, DropdownMenu, DropdownStyle, Icon, IconName,
+    IconPosition, Label, LabelSize, Modal, ModalFooter, ModalHeader, Section, Severity, Switch,
+    SwitchLabelPosition, ToggleState, prelude::*,
 };
 use ui_input::InputField;
 use workspace::ModalView;
@@ -15,6 +19,7 @@ use workspace::ModalView;
 pub(crate) struct ConnectionEditorModal {
     panel: WeakEntity<DatabasePanel>,
     profile: ConnectionProfile,
+    is_new: bool,
     name: Entity<InputField>,
     jdbc_url: Entity<InputField>,
     username: Entity<InputField>,
@@ -38,6 +43,7 @@ impl ConnectionEditorModal {
     pub(crate) fn new(
         panel: WeakEntity<DatabasePanel>,
         profile: ConnectionProfile,
+        is_new: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -51,14 +57,14 @@ impl ConnectionEditorModal {
         let jdbc_url = cx.new(|cx| {
             let input = InputField::new(window, cx, profile.driver.default_jdbc_url())
                 .label("JDBC URL")
-                .tab_index(1);
+                .tab_index(2);
             input.set_text(&profile.jdbc_url, window, cx);
             input
         });
         let username = cx.new(|cx| {
             let input = InputField::new(window, cx, "database user")
                 .label("Username")
-                .tab_index(3);
+                .tab_index(4);
             if let Some(username) = &profile.username {
                 input.set_text(username, window, cx);
             }
@@ -67,14 +73,14 @@ impl ConnectionEditorModal {
         let password = cx.new(|cx| {
             InputField::new(window, cx, "Leave empty to keep the saved password")
                 .label("Password")
-                .tab_index(4)
+                .tab_index(5)
                 .masked(true)
         });
         let custom_driver_path = (profile.driver == database::DatabaseDriver::Custom).then(|| {
             cx.new(|cx| {
                 let input = InputField::new(window, cx, "/path/to/jdbc-driver.jar")
                     .label("JDBC driver JAR")
-                    .tab_index(2);
+                    .tab_index(3);
                 if let Some(path) = &profile.custom_driver_path {
                     input.set_text(&path.to_string_lossy(), window, cx);
                 }
@@ -85,6 +91,7 @@ impl ConnectionEditorModal {
         Self {
             panel,
             profile,
+            is_new,
             name,
             jdbc_url,
             username,
@@ -93,6 +100,97 @@ impl ConnectionEditorModal {
             status: EditorStatus::Idle,
             task: None,
         }
+    }
+
+    fn select_driver(
+        &mut self,
+        driver: DatabaseDriver,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_driver = self.profile.driver;
+        if driver == previous_driver {
+            return;
+        }
+
+        let current_url = self.jdbc_url.read(cx).text(cx);
+        if current_url.trim() == previous_driver.default_jdbc_url() {
+            self.jdbc_url.update(cx, |input, cx| {
+                input.set_text(driver.default_jdbc_url(), window, cx)
+            });
+        }
+
+        let current_name = self.name.read(cx).text(cx);
+        if self.is_new && current_name == self.profile.name {
+            let previous_base_name = format!("Local {previous_driver}");
+            let suffix = self
+                .profile
+                .name
+                .strip_prefix(&previous_base_name)
+                .unwrap_or_default();
+            let suggested_name = format!("Local {driver}{suffix}");
+            self.name
+                .update(cx, |input, cx| input.set_text(&suggested_name, window, cx));
+            self.profile.name = suggested_name;
+        }
+
+        self.profile.driver = driver;
+        let custom_driver_path = self.profile.custom_driver_path.clone();
+        self.custom_driver_path = (driver == DatabaseDriver::Custom).then(|| {
+            cx.new(move |cx| {
+                let input = InputField::new(window, cx, "/path/to/jdbc-driver.jar")
+                    .label("JDBC driver JAR")
+                    .tab_index(3);
+                if let Some(path) = &custom_driver_path {
+                    input.set_text(&path.to_string_lossy(), window, cx);
+                }
+                input
+            })
+        });
+        if driver != DatabaseDriver::Custom {
+            self.profile.custom_driver_path = None;
+        }
+        self.status = EditorStatus::Idle;
+        cx.notify();
+    }
+
+    fn render_driver_selector(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let selected_driver = self.profile.driver;
+        let this = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for driver in DatabaseDriver::ALL {
+                let this = this.clone();
+                menu = menu.toggleable_entry(
+                    driver.display_name(),
+                    driver == selected_driver,
+                    IconPosition::Start,
+                    None,
+                    move |window, cx| {
+                        this.update(cx, |this, cx| this.select_driver(driver, window, cx))
+                            .ok();
+                    },
+                );
+            }
+            menu
+        });
+
+        v_flex()
+            .gap_1()
+            .child(Label::new("Driver").size(LabelSize::Small))
+            .child(
+                DropdownMenu::new(
+                    "database-driver-selector",
+                    selected_driver.display_name(),
+                    menu,
+                )
+                .style(DropdownStyle::Outlined)
+                .full_width(true)
+                .tab_index(1),
+            )
     }
 
     fn profile_from_fields(&mut self, cx: &mut Context<Self>) -> Option<ConnectionProfile> {
@@ -436,7 +534,7 @@ impl EventEmitter<DismissEvent> for ConnectionEditorModal {}
 impl ModalView for ConnectionEditorModal {}
 
 impl Render for ConnectionEditorModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_busy = matches!(
             self.status,
             EditorStatus::Testing | EditorStatus::DownloadingDriver | EditorStatus::Saving
@@ -455,7 +553,11 @@ impl Render for ConnectionEditorModal {
                     .header(
                         ModalHeader::new()
                             .icon(Icon::new(IconName::DatabaseZap).color(Color::Muted))
-                            .headline(format!("{} connection", self.profile.driver))
+                            .headline(if self.is_new {
+                                "New connection".to_owned()
+                            } else {
+                                format!("Edit {} connection", self.profile.driver)
+                            })
                             .description("Configure a JDBC connection. Secrets are stored separately from the profile."),
                     )
                     .section(
@@ -463,6 +565,7 @@ impl Render for ConnectionEditorModal {
                             v_flex()
                                 .gap_3()
                                 .child(self.name.clone())
+                                .child(self.render_driver_selector(window, cx))
                                 .child(self.render_driver_setup(cx))
                                 .child(self.jdbc_url.clone())
                                 .child(
@@ -480,7 +583,7 @@ impl Render for ConnectionEditorModal {
                                                 .label("Read-only connection")
                                                 .label_position(SwitchLabelPosition::Start)
                                                 .full_width(true)
-                                                .tab_index(5_isize)
+                                                .tab_index(6_isize)
                                                 .on_click(move |state, _, cx| {
                                                     this.update(cx, |this, cx| {
                                                         this.profile.read_only =

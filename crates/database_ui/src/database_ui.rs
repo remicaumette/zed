@@ -1,6 +1,8 @@
 mod connection_editor;
+mod console;
 
 use connection_editor::ConnectionEditorModal;
+use console::DatabaseConsole;
 use database::{ConnectionId, ConnectionProfile, ConnectionRegistry, DatabaseDriver};
 use db::kvp::KeyValueStore;
 use gpui::{
@@ -82,7 +84,8 @@ impl DatabasePanel {
         })
     }
 
-    fn new_connection_profile(&self, driver: DatabaseDriver) -> ConnectionProfile {
+    fn new_connection_profile(&self) -> ConnectionProfile {
+        let driver = DatabaseDriver::PostgreSql;
         let base_name = format!("Local {driver}");
         let matching_connections = self
             .registry
@@ -102,6 +105,7 @@ impl DatabasePanel {
     fn open_connection_editor(
         &mut self,
         profile: ConnectionProfile,
+        is_new: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -112,8 +116,24 @@ impl DatabasePanel {
         let panel = cx.weak_entity();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, move |window, cx| {
-                ConnectionEditorModal::new(panel, profile, window, cx)
+                ConnectionEditorModal::new(panel, profile, is_new, window, cx)
             });
+        });
+    }
+
+    fn open_console(
+        &mut self,
+        profile: ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            log::error!("database panel workspace was dropped");
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let console = cx.new(|cx| DatabaseConsole::new(profile, window, cx));
+            workspace.add_item_to_active_pane(Box::new(console), None, true, window, cx);
         });
     }
 
@@ -184,23 +204,20 @@ impl DatabasePanel {
             )
             .child(Label::new("No database connections").color(Color::Muted))
             .child(
-                Label::new("Choose a driver above to configure a connection")
+                Label::new("Create a connection to start exploring a database")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
     }
 
-    fn render_add_button(
-        &self,
-        driver: DatabaseDriver,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        Button::new(format!("add-{driver:?}"), driver.display_name())
-            .style(ButtonStyle::OutlinedGhost)
+    fn render_add_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        Button::new("new-database-connection", "New Connection")
+            .style(ButtonStyle::Outlined)
+            .start_icon(Icon::new(IconName::Plus))
             .label_size(LabelSize::Small)
-            .on_click(cx.listener(move |panel, _, window, cx| {
-                let profile = panel.new_connection_profile(driver);
-                panel.open_connection_editor(profile, window, cx);
+            .on_click(cx.listener(|panel, _, window, cx| {
+                let profile = panel.new_connection_profile();
+                panel.open_connection_editor(profile, true, window, cx);
             }))
     }
 
@@ -216,7 +233,7 @@ impl DatabasePanel {
             .on_click({
                 let profile = profile.clone();
                 cx.listener(move |panel, _, window, cx| {
-                    panel.open_connection_editor(profile.clone(), window, cx);
+                    panel.open_connection_editor(profile.clone(), false, window, cx);
                 })
             })
             .child(
@@ -252,15 +269,25 @@ impl DatabasePanel {
                                 .color(Color::Error),
                         ),
                     })
-                    .child(
+                    .child({
+                        let profile = profile.clone();
+                        IconButton::new(format!("console-{id}"), IconName::Terminal)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Open query console"))
+                            .on_click(cx.listener(move |panel, _, window, cx| {
+                                cx.stop_propagation();
+                                panel.open_console(profile.clone(), window, cx);
+                            }))
+                    })
+                    .child({
                         IconButton::new(format!("edit-{id}"), IconName::Pencil)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Edit connection"))
                             .on_click(cx.listener(move |panel, _, window, cx| {
                                 cx.stop_propagation();
-                                panel.open_connection_editor(profile.clone(), window, cx);
-                            })),
-                    )
+                                panel.open_connection_editor(profile.clone(), false, window, cx);
+                            }))
+                    })
                     .child(
                         IconButton::new(format!("remove-{id}"), IconName::Trash)
                             .icon_size(IconSize::Small)
@@ -311,11 +338,7 @@ impl Render for DatabasePanel {
                     .px_2()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(self.render_add_button(DatabaseDriver::PostgreSql, cx))
-                    .child(self.render_add_button(DatabaseDriver::MySql, cx))
-                    .child(self.render_add_button(DatabaseDriver::ClickHouse, cx))
-                    .child(self.render_add_button(DatabaseDriver::Sqlite, cx))
-                    .child(self.render_add_button(DatabaseDriver::Custom, cx)),
+                    .child(self.render_add_button(cx)),
             )
             .child(if connections.is_empty() {
                 self.render_empty_state(cx).into_any_element()

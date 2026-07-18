@@ -1,7 +1,7 @@
 use crate::{ConnectionProfile, resolve_jdbc_driver_path};
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -9,7 +9,7 @@ use std::{
 use uuid::Uuid;
 
 const PROTOCOL_VERSION: u32 = 1;
-const MAX_FRAME_SIZE: usize = 1024 * 1024;
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +21,23 @@ pub struct ConnectionTestResult {
     pub round_trip_millis: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryColumn {
+    pub label: String,
+    pub type_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryResult {
+    pub columns: Vec<QueryColumn>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub affected_rows: Option<u64>,
+    pub truncated: bool,
+    pub elapsed_millis: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RequestEnvelope<'a> {
@@ -28,6 +45,10 @@ struct RequestEnvelope<'a> {
     request_id: Uuid,
     operation: &'static str,
     connection: ConnectionRequest<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sql: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_rows: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -42,11 +63,11 @@ struct ConnectionRequest<'a> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ResponseEnvelope {
+struct ResponseEnvelope<T> {
     protocol_version: u32,
     request_id: Uuid,
     ok: bool,
-    result: Option<ConnectionTestResult>,
+    result: Option<T>,
     error: Option<SidecarError>,
 }
 
@@ -62,6 +83,66 @@ pub async fn test_connection(
     profile: &ConnectionProfile,
     password: Option<&str>,
 ) -> Result<ConnectionTestResult> {
+    let request_id = Uuid::new_v4();
+    invoke(
+        profile,
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            operation: "testConnection",
+            connection: connection_request(profile, password),
+            sql: None,
+            max_rows: None,
+        },
+    )
+    .await
+}
+
+pub async fn execute_query(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+    sql: &str,
+    max_rows: u32,
+) -> Result<QueryResult> {
+    if sql.trim().is_empty() {
+        bail!("SQL cannot be empty");
+    }
+    if max_rows == 0 {
+        bail!("query row limit must be greater than zero");
+    }
+
+    let request_id = Uuid::new_v4();
+    invoke(
+        profile,
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            operation: "execute",
+            connection: connection_request(profile, password),
+            sql: Some(sql),
+            max_rows: Some(max_rows),
+        },
+    )
+    .await
+}
+
+fn connection_request<'a>(
+    profile: &'a ConnectionProfile,
+    password: Option<&'a str>,
+) -> ConnectionRequest<'a> {
+    ConnectionRequest {
+        jdbc_url: &profile.jdbc_url,
+        username: profile.username.as_deref(),
+        password,
+        read_only: profile.read_only,
+        timeout_seconds: 10,
+    }
+}
+
+async fn invoke<T>(profile: &ConnectionProfile, request: RequestEnvelope<'_>) -> Result<T>
+where
+    T: DeserializeOwned,
+{
     profile.validate()?;
     let jar_path = sidecar_jar_path();
     if !jar_path.is_file() {
@@ -74,20 +155,7 @@ pub async fn test_connection(
     let classpath = std::env::join_paths([jar_path.as_os_str(), driver_path.as_os_str()])
         .context("building the JDBC sidecar classpath")?;
 
-    let request_id = Uuid::new_v4();
-    let request = RequestEnvelope {
-        protocol_version: PROTOCOL_VERSION,
-        request_id,
-        operation: "testConnection",
-        connection: ConnectionRequest {
-            jdbc_url: &profile.jdbc_url,
-            username: profile.username.as_deref(),
-            password,
-            read_only: profile.read_only,
-            timeout_seconds: 10,
-        },
-    };
-
+    let request_id = request.request_id;
     let payload = serde_json::to_vec(&request).context("serializing JDBC request")?;
     if payload.len() > MAX_FRAME_SIZE {
         bail!("JDBC request exceeds the maximum frame size");
@@ -162,7 +230,7 @@ pub async fn test_connection(
         );
     }
 
-    let response = serde_json::from_slice::<ResponseEnvelope>(&response_payload)
+    let response = serde_json::from_slice::<ResponseEnvelope<T>>(&response_payload)
         .context("decoding JDBC response")?;
     if response.protocol_version != PROTOCOL_VERSION {
         bail!(
@@ -218,6 +286,8 @@ mod tests {
                 read_only: profile.read_only,
                 timeout_seconds: 10,
             },
+            sql: None,
+            max_rows: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -238,6 +308,38 @@ mod tests {
 
         assert_eq!(result.database_product, "SQLite");
         assert!(database_path.is_file());
+    }
+
+    #[test]
+    #[ignore = "requires Java and a built JDBC sidecar"]
+    fn executes_sqlite_query_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("query-smoke-test.sqlite");
+        let mut profile = ConnectionProfile::new("Query smoke test", DatabaseDriver::Sqlite);
+        profile.jdbc_url = format!("jdbc:sqlite:{}", database_path.display());
+
+        let result = smol::block_on(execute_query(
+            &profile,
+            None,
+            "select 42 as answer, null as missing",
+            100,
+        ))
+        .unwrap();
+
+        assert_eq!(result.columns[0].label, "answer");
+        assert_eq!(result.rows, vec![vec![Some("42".into()), None]]);
+        assert_eq!(result.affected_rows, None);
+        assert!(!result.truncated);
+
+        let result = smol::block_on(execute_query(
+            &profile,
+            None,
+            "with recursive counter(value) as (values(1) union all select value + 1 from counter where value < 20) select value from counter",
+            10,
+        ))
+        .unwrap();
+        assert_eq!(result.rows.len(), 10);
+        assert!(result.truncated);
     }
 
     #[test]

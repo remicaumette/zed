@@ -11,7 +11,7 @@ mod sidecar;
 pub use driver_manager::{
     JdbcDriverDownload, download_jdbc_driver, installed_jdbc_driver_path, resolve_jdbc_driver_path,
 };
-pub use sidecar::{ConnectionTestResult, test_connection};
+pub use sidecar::{ConnectionTestResult, QueryColumn, QueryResult, execute_query, test_connection};
 
 /// Version of the serialized connection registry.
 pub const CONNECTION_REGISTRY_VERSION: u32 = 1;
@@ -59,6 +59,14 @@ pub enum DatabaseDriver {
 }
 
 impl DatabaseDriver {
+    pub const ALL: [Self; 5] = [
+        Self::PostgreSql,
+        Self::MySql,
+        Self::ClickHouse,
+        Self::Sqlite,
+        Self::Custom,
+    ];
+
     pub fn display_name(self) -> &'static str {
         match self {
             Self::PostgreSql => "PostgreSQL",

@@ -15,8 +15,8 @@ The first supported databases are PostgreSQL, MySQL, ClickHouse, and SQLite.
 
 Last updated: July 18, 2026.
 
-The project now spans milestones 0 and 1. Connection profiles can be edited and
-tested against a real database through the JDBC sidecar.
+The project now spans milestones 0, 1, and the first vertical slice of milestone 3. Connection profiles can be edited and tested against a real database, and a
+saved connection can open a native SQL console backed by the JDBC sidecar.
 
 - [x] Add versioned connection profile types.
 - [x] Validate JDBC URLs without storing secrets in the profile.
@@ -28,6 +28,9 @@ tested against a real database through the JDBC sidecar.
 - [x] Test a real connection from the editor and display driver metadata.
 - [x] Download missing built-in drivers on demand with SHA-256 verification.
 - [x] Accept a user-provided JAR for custom JDBC connections.
+- [x] Select the database driver inside a single New Connection dialog.
+- [x] Open a SQL console tab from a saved connection.
+- [x] Execute one JDBC statement and display bounded rows or an affected-row count.
 - [x] Exercise the complete protocol against a temporary SQLite database.
 - [ ] Run contract tests against PostgreSQL, MySQL, and ClickHouse containers.
 - [ ] Package the sidecar as part of release builds.
@@ -59,8 +62,10 @@ discovers it from the JDBC URL.
 Protocol version 1 uses length-prefixed JSON envelopes. Each request has an ID
 and an explicit protocol version. Standard output is reserved for protocol
 frames; diagnostics go to standard error. An incompatible version is rejected
-with an actionable error. Deadlines, cancellation, and a persistent sidecar
-process are still planned before query execution is added.
+with an actionable error. The initial query operation returns at most 200 rows,
+truncates oversized cell/result text, and caps protocol frames at 16 MiB.
+Deadlines beyond JDBC's optional timeout, cancellation, result streaming, and a
+persistent sidecar process are still planned.
 
 ### Crate boundaries
 
@@ -70,8 +75,8 @@ process are still planned before query execution is added.
   views, and presentation state.
 - The Rust driver manager owns verified downloads, installed-driver state, and
   custom JAR paths.
-- The Java module owns generic JDBC connection tests. It will also own
-  connection pools, statement execution, and result streaming.
+- The Java module owns generic JDBC connection tests and bounded statement
+  execution. It will also own connection pools and result streaming.
 - Zed's main crate only initializes the subsystem and adds its panel.
 
 Zed already has a virtualized table component with dynamic, resizable, and
@@ -164,7 +169,8 @@ containerized databases and a temporary SQLite file.
 
 ### Milestone 3: query console
 
-- SQL editor associated with a connection and schema.
+- [x] Native SQL editor tab associated with a saved connection.
+- [x] Execute a statement and show bounded text results in Zed's table component.
 - Execute selection or statement with cancellation and timeout.
 - Stream bounded result batches into Zed's virtualized table.
 - Display affected rows, duration, warnings, and sanitized errors.
@@ -195,6 +201,7 @@ Run the smallest relevant checks during development:
 ```sh
 cargo test -p database
 cargo test -p database sidecar::tests::connects_to_sqlite_end_to_end -- --ignored --exact
+cargo test -p database sidecar::tests::executes_sqlite_query_end_to_end -- --ignored --exact
 cargo test -p database sidecar::tests::resolves_all_managed_jdbc_drivers -- --ignored --exact
 cargo check -p database_ui
 cargo check -p zed
@@ -219,16 +226,20 @@ For the current connection-editor and JDBC slice:
 1. Run `script/build-database-sidecar`.
 2. Build and launch the development version of Zed.
 3. Open the Database panel using its database icon in the right dock.
-4. Select SQLite and confirm that the editor reports the driver as missing.
-5. Select **Download Driver** and wait for the installed confirmation.
-6. Keep the generated JDBC URL, or point it at a disposable file.
-7. Change the name and read-only setting, then select **Test Connection**.
-8. Confirm that the success message contains SQLite and JDBC driver versions.
-9. Save the connection, close and reopen Zed, and confirm the profile remains.
-10. Edit the saved profile, enter a password if the target database needs one,
+4. Select **New Connection**, then select SQLite in the Driver dropdown.
+5. Confirm that the editor reports the driver as missing when it is not installed.
+6. Select **Download Driver** and wait for the installed confirmation.
+7. Keep the generated JDBC URL, or point it at a disposable file.
+8. Change the name and read-only setting, then select **Test Connection**.
+9. Confirm that the success message contains SQLite and JDBC driver versions.
+10. Save the connection, then select its terminal icon to open a query console.
+11. Run `select 42 as answer, null as missing;` and confirm that one result row
+    appears with an `answer` column and a muted `NULL` cell.
+12. Close and reopen Zed, and confirm the profile remains.
+13. Edit the saved profile, enter a password if the target database needs one,
     save it, then reopen the editor. The password field must remain visually
     empty while **Test Connection** continues to use the stored secret.
-11. Remove the profile, restart Zed, and confirm it stays removed.
+14. Remove the profile, restart Zed, and confirm it stays removed.
 
 Also create a **Custom JDBC** connection, select a local driver JAR with
 **Browse**, and confirm that Zed uses it without copying or downloading it.
@@ -243,8 +254,9 @@ jdbc:clickhouse://localhost:8123/default
 jdbc:sqlite:database.sqlite
 ```
 
-The sidecar currently starts once per connection test. Persistent process
-management, cancellation, and metadata browsing are the next runtime slice.
+The sidecar currently starts once per connection test or statement. Persistent
+process management, cancellation, query selection, and metadata browsing are
+the next runtime slices.
 
 ## Decisions
 

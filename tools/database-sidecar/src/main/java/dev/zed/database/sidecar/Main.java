@@ -11,15 +11,22 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.regex.Pattern;
 
 public final class Main {
     private static final int PROTOCOL_VERSION = 1;
-    private static final int MAX_FRAME_SIZE = 1024 * 1024;
+    private static final int MAX_FRAME_SIZE = 16 * 1024 * 1024;
+    private static final int MAX_CELL_CHARACTERS = 4096;
+    private static final int MAX_RESULT_CHARACTERS = 500_000;
     private static final Pattern SECRET_PATTERN = Pattern.compile(
         "(?i)(password|passwd|pwd|token|secret)=([^&;\\s]+)"
     );
@@ -54,17 +61,23 @@ public final class Main {
                 null
             );
         }
-        if (!"testConnection".equals(request.operation)) {
-            return ResponseEnvelope.error(
-                request.requestId,
-                "unsupported_operation",
-                "Unsupported operation",
-                null
-            );
-        }
-
         try {
-            return ResponseEnvelope.success(request.requestId, testConnection(request.connection));
+            switch (request.operation) {
+                case "testConnection":
+                    return ResponseEnvelope.success(
+                        request.requestId,
+                        testConnection(request.connection)
+                    );
+                case "execute":
+                    return ResponseEnvelope.success(request.requestId, execute(request));
+                default:
+                    return ResponseEnvelope.error(
+                        request.requestId,
+                        "unsupported_operation",
+                        "Unsupported operation",
+                        null
+                    );
+            }
         } catch (SQLException error) {
             return ResponseEnvelope.error(
                 request.requestId,
@@ -84,22 +97,9 @@ public final class Main {
 
     private static ConnectionTestResult testConnection(ConnectionRequest request)
         throws SQLException {
-        Properties properties = new Properties();
-        if (request.username != null && !request.username.isBlank()) {
-            properties.setProperty("user", request.username);
-        }
-        if (request.password != null && !request.password.isEmpty()) {
-            properties.setProperty("password", request.password);
-        }
-
         DriverManager.setLoginTimeout(Math.max(1, request.timeoutSeconds));
         Instant startedAt = Instant.now();
-        try (Connection connection = DriverManager.getConnection(request.jdbcUrl, properties)) {
-            try {
-                connection.setReadOnly(request.readOnly);
-            } catch (SQLException | UnsupportedOperationException ignored) {
-                // Read-only is also enforced by the query executor. This flag is best effort.
-            }
+        try (Connection connection = openConnection(request)) {
 
             if (!connection.isValid(Math.max(1, request.timeoutSeconds))) {
                 throw new SQLException("The driver reported an invalid connection");
@@ -114,6 +114,117 @@ public final class Main {
                 Duration.between(startedAt, Instant.now()).toMillis()
             );
         }
+    }
+
+    private static QueryResult execute(RequestEnvelope request) throws SQLException {
+        if (request.sql == null || request.sql.isBlank()) {
+            throw new IllegalArgumentException("SQL cannot be empty");
+        }
+        if (request.maxRows <= 0) {
+            throw new IllegalArgumentException("maxRows must be greater than zero");
+        }
+
+        DriverManager.setLoginTimeout(Math.max(1, request.connection.timeoutSeconds));
+        Instant startedAt = Instant.now();
+        try (Connection connection = openConnection(request.connection);
+             Statement statement = connection.createStatement()) {
+            try {
+                statement.setQueryTimeout(Math.max(1, request.connection.timeoutSeconds));
+            } catch (SQLException | UnsupportedOperationException ignored) {
+                // Query timeouts are optional in JDBC drivers.
+            }
+            try {
+                statement.setMaxRows(request.maxRows == Integer.MAX_VALUE
+                    ? request.maxRows
+                    : request.maxRows + 1);
+            } catch (SQLException | UnsupportedOperationException ignored) {
+                // The result reader still enforces the row limit.
+            }
+
+            boolean hasResultSet = statement.execute(request.sql);
+            if (!hasResultSet) {
+                int updateCount = statement.getUpdateCount();
+                return new QueryResult(
+                    List.of(),
+                    List.of(),
+                    updateCount >= 0 ? Long.valueOf(updateCount) : null,
+                    false,
+                    Duration.between(startedAt, Instant.now()).toMillis()
+                );
+            }
+
+            try (ResultSet resultSet = statement.getResultSet()) {
+                ResultSetMetaData metadata = resultSet.getMetaData();
+                int columnCount = metadata.getColumnCount();
+                List<QueryColumn> columns = new ArrayList<>(columnCount);
+                for (int column = 1; column <= columnCount; column++) {
+                    String label = metadata.getColumnLabel(column);
+                    if (label == null || label.isBlank()) {
+                        label = metadata.getColumnName(column);
+                    }
+                    columns.add(new QueryColumn(label, metadata.getColumnTypeName(column)));
+                }
+
+                List<List<String>> rows = new ArrayList<>();
+                boolean truncated = false;
+                int remainingCharacters = MAX_RESULT_CHARACTERS;
+                rowsLoop:
+                while (resultSet.next()) {
+                    if (rows.size() >= request.maxRows) {
+                        truncated = true;
+                        break;
+                    }
+
+                    List<String> row = new ArrayList<>(columnCount);
+                    for (int column = 1; column <= columnCount; column++) {
+                        String value = resultSet.getString(column);
+                        if (value != null && value.length() > MAX_CELL_CHARACTERS) {
+                            value = value.substring(0, MAX_CELL_CHARACTERS);
+                            truncated = true;
+                        }
+                        if (value != null && value.length() > remainingCharacters) {
+                            value = value.substring(0, remainingCharacters);
+                            truncated = true;
+                        }
+                        row.add(value);
+                        if (value != null) {
+                            remainingCharacters -= value.length();
+                        }
+                    }
+                    rows.add(row);
+                    if (remainingCharacters == 0) {
+                        truncated = true;
+                        break rowsLoop;
+                    }
+                }
+
+                return new QueryResult(
+                    columns,
+                    rows,
+                    null,
+                    truncated,
+                    Duration.between(startedAt, Instant.now()).toMillis()
+                );
+            }
+        }
+    }
+
+    private static Connection openConnection(ConnectionRequest request) throws SQLException {
+        Properties properties = new Properties();
+        if (request.username != null && !request.username.isBlank()) {
+            properties.setProperty("user", request.username);
+        }
+        if (request.password != null && !request.password.isEmpty()) {
+            properties.setProperty("password", request.password);
+        }
+
+        Connection connection = DriverManager.getConnection(request.jdbcUrl, properties);
+        try {
+            connection.setReadOnly(request.readOnly);
+        } catch (SQLException | UnsupportedOperationException ignored) {
+            // Some JDBC drivers do not support this hint.
+        }
+        return connection;
     }
 
     private static byte[] readFrame(DataInputStream input) throws Exception {
@@ -147,6 +258,8 @@ public final class Main {
         public String requestId;
         public String operation;
         public ConnectionRequest connection;
+        public String sql;
+        public int maxRows;
     }
 
     public static final class ConnectionRequest {
@@ -161,10 +274,10 @@ public final class Main {
         public int protocolVersion = PROTOCOL_VERSION;
         public String requestId;
         public boolean ok;
-        public ConnectionTestResult result;
+        public Object result;
         public SidecarError error;
 
-        static ResponseEnvelope success(String requestId, ConnectionTestResult result) {
+        static ResponseEnvelope success(String requestId, Object result) {
             ResponseEnvelope response = new ResponseEnvelope();
             response.requestId = requestId;
             response.ok = true;
@@ -205,6 +318,38 @@ public final class Main {
             this.driverName = driverName;
             this.driverVersion = driverVersion;
             this.roundTripMillis = roundTripMillis;
+        }
+    }
+
+    public static final class QueryColumn {
+        public final String label;
+        public final String typeName;
+
+        QueryColumn(String label, String typeName) {
+            this.label = label;
+            this.typeName = typeName;
+        }
+    }
+
+    public static final class QueryResult {
+        public final List<QueryColumn> columns;
+        public final List<List<String>> rows;
+        public final Long affectedRows;
+        public final boolean truncated;
+        public final long elapsedMillis;
+
+        QueryResult(
+            List<QueryColumn> columns,
+            List<List<String>> rows,
+            Long affectedRows,
+            boolean truncated,
+            long elapsedMillis
+        ) {
+            this.columns = columns;
+            this.rows = rows;
+            this.affectedRows = affectedRows;
+            this.truncated = truncated;
+            this.elapsedMillis = elapsedMillis;
         }
     }
 
