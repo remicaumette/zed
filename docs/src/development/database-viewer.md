@@ -42,7 +42,7 @@ in a native Zed view with staged row editing.
 - [x] Cycle ascending, descending, and unsorted order by selecting a result column.
 - [x] Display row and column borders so editable cells are clearly delimited.
 - [x] Edit cells inline, add rows, and stage row deletions for tables with a primary key.
-- [x] Pick calendar dates for JDBC date and timestamp cells while preserving timestamp times.
+- [x] Pick dates for JDBC date cells and date/time values for timestamp cells.
 - [x] Select rows and expose NULL, delete, and foreign-key navigation context actions.
 - [x] Page through table data in bounded 100-row JDBC result windows.
 - [x] Confirm before discarding staged changes during result navigation.
@@ -220,7 +220,7 @@ configured bound.
 - Persistent result tabs and query history across executions.
 - [x] Editable table data with safe primary-key requirements.
 - [x] Staged inserts, updates, and deletions with atomic save and discard.
-- [x] Calendar picker for JDBC date and timestamp values.
+- [x] Date picker for JDBC dates and date/time picker for timestamp values.
 - Improve JDBC value editors for binary, JSON, and database-specific types.
 - Add optimistic concurrency checks and a generated SQL preview.
 - DDL preview, data export, and explain plans.
@@ -318,8 +318,9 @@ For metadata and table data:
    cell, edit its value, then select another cell. Confirm that the
    changed cell is highlighted but that the database has not changed yet.
 10. Double-click a JDBC `DATE`, `TIMESTAMP`, or `DATETIME` cell, then select the
-    clock button. Choose a day in the calendar and confirm that timestamps keep
-    their existing time and timezone suffix.
+    clock button. Confirm that the cell editor remains open, choosing a day does
+    not close the popover, and only **Apply** stages the value. Timestamp pickers
+    also expose a `TIME` field and preserve fractions of a second and timezones.
 11. Right-click a cell and select **Set NULL**. Confirm that `NULL` is staged while
     typing the text `NULL` directly remains an ordinary string value.
 12. Add a row, enter its values, mark an existing row for deletion using either
@@ -342,8 +343,8 @@ For metadata and table data:
 The first editing slice sends at most 1,000 row mutations per save and relies on
 JDBC conversion from entered text to the reported column type. It intentionally
 requires both a writable connection and a JDBC-reported primary key. Temporal
-cells have a calendar picker; richer binary, JSON, and database-specific editors
-and optimistic concurrency checks remain planned. Editing is also
+cells have type-aware date and date/time pickers; richer binary, JSON, and
+database-specific editors and optimistic concurrency checks remain planned. Editing is also
 disabled when the bounded result reader had to truncate a cell, so a shortened
 primary-key value can never identify the wrong row.
 

@@ -437,12 +437,27 @@ impl TableDataView {
         let focus_handle = input.focus_handle(cx);
         let date_picker_open = Rc::new(Cell::new(false));
         let date_picker_open_for_focus = date_picker_open.clone();
+        let view_for_focus = cx.weak_entity();
         let focus_out_subscription =
-            cx.on_focus_out(&focus_handle, window, move |this, _, _, cx| {
-                if !date_picker_open_for_focus.get() {
-                    this.commit_active_edit(cx);
-                    cx.notify();
-                }
+            cx.on_focus_out(&focus_handle, window, move |_, _, window, _cx| {
+                let date_picker_open = date_picker_open_for_focus.clone();
+                let view = view_for_focus.clone();
+                window.on_next_frame(move |window, _| {
+                    window.on_next_frame(move |_, cx| {
+                        if !date_picker_open.get() {
+                            view.update(cx, |this, cx| {
+                                let same_cell = this.editing_cell.as_ref().is_some_and(|editor| {
+                                    editor.row == row && editor.column == column
+                                });
+                                if same_cell {
+                                    this.commit_active_edit(cx);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        }
+                    });
+                });
             });
         self.editing_cell = Some(ActiveCellEditor {
             row,
@@ -938,6 +953,10 @@ impl TableDataView {
                             .child(div().min_w_0().flex_1().child(editor.input.clone()));
 
                         if let Some(temporal_kind) = temporal_kind {
+                            let picker_label = match temporal_kind {
+                                TemporalCellKind::Date => "Choose date",
+                                TemporalCellKind::Timestamp => "Choose date and time",
+                            };
                             let input_for_picker = editor.input.clone();
                             let edited = editor.edited.clone();
                             let date_picker_open = editor.date_picker_open.clone();
@@ -958,14 +977,15 @@ impl TableDataView {
                                         IconName::Clock,
                                     )
                                     .shape(IconButtonShape::Square)
-                                    .aria_label("Choose date"),
+                                    .aria_label(picker_label),
                                 )
                                 .anchor(gpui::Anchor::TopRight)
                                 .on_open(Rc::new(move |_, _| date_picker_open_for_open.set(true)))
-                                .menu(move |_window, cx| {
+                                .menu(move |window, cx| {
                                     let current_value = input_for_picker.read(cx).text(cx);
                                     let selected = date_from_value(&current_value)
                                         .unwrap_or_else(|| Local::now().date_naive());
+                                    let time = temporal_kind.picker_time(&current_value);
                                     let input = input_for_picker.clone();
                                     let edited = edited.clone();
                                     let view = view.clone();
@@ -973,17 +993,23 @@ impl TableDataView {
                                     Some(cx.new(|cx| {
                                         DatePicker::new(
                                             selected,
+                                            temporal_kind,
+                                            time,
                                             date_picker_open,
-                                            Box::new(move |date, window, cx| {
+                                            Box::new(move |date, time, window, cx| {
                                                 let current_value = input.read(cx).text(cx);
-                                                let value = temporal_kind
-                                                    .value_with_date(&current_value, date);
+                                                let value = temporal_kind.value_from_picker(
+                                                    &current_value,
+                                                    date,
+                                                    time.as_deref(),
+                                                );
                                                 input.update(cx, |input, cx| {
                                                     input.set_text(&value, window, cx)
                                                 });
                                                 edited.set(true);
                                                 view.update(cx, |_, cx| cx.notify()).ok();
                                             }),
+                                            window,
                                             cx,
                                         )
                                     }))
