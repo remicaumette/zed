@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+maven_version="3.9.9"
+tools_dir="${repository_dir}/target/database-sidecar-tools"
+maven_dir="${tools_dir}/apache-maven-${maven_version}"
+archive_path="${tools_dir}/apache-maven-${maven_version}-bin.tar.gz"
+
+if command -v mvn >/dev/null 2>&1; then
+    maven_command="$(command -v mvn)"
+else
+    mkdir -p "${tools_dir}"
+    if [[ ! -x "${maven_dir}/bin/mvn" ]]; then
+        if [[ ! -f "${archive_path}" ]]; then
+            curl --fail --location --silent --show-error \
+                "https://archive.apache.org/dist/maven/maven-3/${maven_version}/binaries/apache-maven-${maven_version}-bin.tar.gz" \
+                --output "${archive_path}"
+        fi
+        tar -xzf "${archive_path}" -C "${tools_dir}"
+    fi
+    maven_command="${maven_dir}/bin/mvn"
+fi
+
+exec "${maven_command}" \
+    --file "${repository_dir}/tools/database-sidecar/pom.xml" \
+    --batch-mode \
+    package \
+    "$@"

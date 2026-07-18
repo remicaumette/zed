@@ -13,9 +13,14 @@ path = "src/database.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
+async-process.workspace = true
+futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+smol.workspace = true
+tempfile.workspace = true

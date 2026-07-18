@@ -15,18 +15,20 @@ The first supported databases are PostgreSQL, MySQL, ClickHouse, and SQLite.
 
 Last updated: July 18, 2026.
 
-The project is in milestone 0. The first vertical slice is under development.
+The project now spans milestones 0 and 1. Connection profiles can be edited and
+tested against a real database through the JDBC sidecar.
 
 - [x] Add versioned connection profile types.
 - [x] Validate JDBC URLs without storing secrets in the profile.
 - [x] Register a native Database panel in Zed's dock.
-- [x] List, create, remove, and persist local connection drafts.
-- [ ] Replace quick-add drafts with a complete connection editor.
-- [ ] Start the JDBC sidecar and negotiate its protocol version.
-- [ ] Test a real connection from the editor.
-
-The quick-add controls are temporary. They make the list and persistence
-testable before the connection editor and JDBC runtime are available.
+- [x] List, create, edit, remove, and persist connection profiles.
+- [x] Configure JDBC URL, username, password, environment, and read-only mode.
+- [x] Store passwords through Zed's credential provider instead of profile data.
+- [x] Start the JDBC sidecar and validate its protocol version.
+- [x] Test a real connection from the editor and display driver metadata.
+- [x] Exercise the complete protocol against a temporary SQLite database.
+- [ ] Run contract tests against PostgreSQL, MySQL, and ClickHouse containers.
+- [ ] Package the sidecar as part of release builds.
 
 ## Architecture
 
@@ -48,10 +50,11 @@ Running JDBC out of process keeps the JVM out of Zed's address space. A driver
 or JVM crash cannot corrupt the editor process, and Java dependencies stay out
 of Cargo's dependency graph.
 
-The sidecar protocol will use length-prefixed Protobuf messages. Each request
-will have an ID, deadline, and cancellation path. Standard output is reserved
-for protocol frames; logs go to standard error. The handshake will reject an
-incompatible protocol version with an actionable error.
+Protocol version 1 uses length-prefixed JSON envelopes. Each request has an ID
+and an explicit protocol version. Standard output is reserved for protocol
+frames; diagnostics go to standard error. An incompatible version is rejected
+with an actionable error. Deadlines, cancellation, and a persistent sidecar
+process are still planned before query execution is added.
 
 ### Crate boundaries
 
@@ -59,8 +62,9 @@ incompatible protocol version with an actionable error.
   service interfaces. It does not depend on GPUI or Java.
 - `database_ui` owns the dock panel, connection editor, object tree, query
   views, and presentation state.
-- The future Java module owns JDBC driver loading, connection pools, metadata
-  adapters, statement execution, and result streaming.
+- The Java module owns JDBC driver loading and connection tests. It will also
+  own connection pools, metadata adapters, statement execution, and result
+  streaming.
 - Zed's main crate only initializes the subsystem and adds its panel.
 
 Zed already has a virtualized table component with dynamic, resizable, and
@@ -73,20 +77,23 @@ A saved profile contains a stable ID, display name, JDBC URL, username, scope,
 environment label, and read-only preference. Passwords and access tokens are
 never serialized with the profile.
 
-Credentials will use Zed's credential provider. They are sent to the sidecar
-only when opening a connection and are never returned in errors or logs.
+Credentials use Zed's credential provider. They are sent to the sidecar only
+when opening a connection and are never returned in errors or logs. Development
+builds use Zed's development credential store by default; set
+`ZED_DEVELOPMENT_USE_KEYCHAIN=1` before launching Zed to exercise the operating
+system keychain.
 
 Connections default to read-only. Production profiles will receive a visible
 warning treatment before any write-capable mode is enabled.
 
 ## Driver strategy
 
-| Database   | JDBC driver        | First metadata adapter |
-| ---------- | ------------------ | ---------------------- |
-| PostgreSQL | PostgreSQL JDBC    | PostgreSQL             |
-| MySQL      | MySQL Connector/J  | MySQL                  |
-| ClickHouse | ClickHouse JDBC    | ClickHouse             |
-| SQLite     | Xerial SQLite JDBC | SQLite                 |
+| Database   | JDBC driver                                                                             | Pinned version | First metadata adapter |
+| ---------- | --------------------------------------------------------------------------------------- | -------------- | ---------------------- |
+| PostgreSQL | [PostgreSQL JDBC](https://central.sonatype.com/artifact/org.postgresql/postgresql)      | 42.7.11        | PostgreSQL             |
+| MySQL      | [MySQL Connector/J](https://central.sonatype.com/artifact/com.mysql/mysql-connector-j)  | 9.7.0          | MySQL                  |
+| ClickHouse | [ClickHouse JDBC](https://central.sonatype.com/artifact/com.clickhouse/clickhouse-jdbc) | 0.9.8          | ClickHouse             |
+| SQLite     | [Xerial SQLite JDBC](https://central.sonatype.com/artifact/org.xerial/sqlite-jdbc)      | 3.53.2.0       | SQLite                 |
 
 `DatabaseMetaData` supplies the common baseline. Small dialect adapters will
 fill gaps and normalize database-specific behavior. This preserves JDBC's
@@ -161,10 +168,18 @@ This milestone will be split into smaller proposals before implementation.
 
 ## Quality gates
 
+Build the JDBC sidecar first. The script uses an installed Maven binary when
+available, otherwise it downloads Maven into Zed's ignored `target` directory.
+
+```sh
+script/build-database-sidecar
+```
+
 Run the smallest relevant checks during development:
 
 ```sh
 cargo test -p database
+cargo test -p database sidecar::tests::connects_to_sqlite_end_to_end -- --ignored --exact
 cargo check -p database_ui
 cargo check -p zed
 ```
@@ -183,16 +198,34 @@ protocol mismatch, process crash, and network loss.
 
 ## Manual test checklist
 
-For the current connection-list slice:
+For the current connection-editor and JDBC slice:
 
-1. Build and launch the development version of Zed.
-2. Open the Database panel using its database icon in the right dock.
-3. Add one draft for each supported driver.
-4. Close and reopen Zed, then confirm the four profiles are still listed.
-5. Remove a profile, restart Zed, and confirm it stays removed.
+1. Run `script/build-database-sidecar`.
+2. Build and launch the development version of Zed.
+3. Open the Database panel using its database icon in the right dock.
+4. Select SQLite and keep the generated JDBC URL, or point it at a disposable
+   file.
+5. Change the name, environment, and read-only setting, then select **Test
+   Connection**.
+6. Confirm that the success message contains SQLite and JDBC driver versions.
+7. Save the connection, close and reopen Zed, and confirm the profile remains.
+8. Edit the saved profile, enter a password if the target database needs one,
+   save it, then reopen the editor. The password field must remain visually
+   empty while **Test Connection** continues to use the stored secret.
+9. Remove the profile, restart Zed, and confirm it stays removed.
 
-Do not enter real credentials yet. The current slice does not expose a
-credential editor or connect to a database.
+Then repeat the test with available PostgreSQL, MySQL, and ClickHouse instances.
+Use driver-specific JDBC URLs such as:
+
+```text
+jdbc:postgresql://localhost:5432/postgres
+jdbc:mysql://localhost:3306/mysql
+jdbc:clickhouse://localhost:8123/default
+jdbc:sqlite:database.sqlite
+```
+
+The sidecar currently starts once per connection test. Persistent process
+management, cancellation, and metadata browsing are the next runtime slice.
 
 ## Decisions
 

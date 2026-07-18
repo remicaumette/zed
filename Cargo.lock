@@ -4921,8 +4921,13 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 name = "database"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-process",
+ "futures 0.3.32",
  "serde",
  "serde_json",
+ "smol",
+ "tempfile",
  "thiserror 2.0.17",
  "uuid",
 ]
@@ -4932,14 +4937,18 @@ name = "database_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "credentials_provider",
  "database",
  "db",
  "gpui",
  "log",
+ "menu",
  "serde_json",
  "ui",
+ "ui_input",
  "workspace",
  "zed_actions",
+ "zed_credentials_provider",
 ]
 
 [[package]]

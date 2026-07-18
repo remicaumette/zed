@@ -1,9 +1,13 @@
+mod connection_editor;
+
+use connection_editor::ConnectionEditorModal;
 use database::{ConnectionId, ConnectionProfile, ConnectionRegistry, DatabaseDriver};
 use db::kvp::KeyValueStore;
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, Pixels, Render, StatefulInteractiveElement, WeakEntity, Window, px,
 };
+use std::collections::HashMap;
 use ui::{
     Button, ButtonStyle, Color, Icon, IconButton, IconName, IconSize, Label, LabelSize, ListItem,
     Tooltip, prelude::*,
@@ -32,10 +36,18 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct DatabasePanel {
+    workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     position: DockPosition,
     active: bool,
     registry: ConnectionRegistry,
+    connection_states: HashMap<ConnectionId, ConnectionState>,
+}
+
+#[derive(Clone)]
+pub(crate) enum ConnectionState {
+    Connected,
+    Error,
 }
 
 impl DatabasePanel {
@@ -57,17 +69,20 @@ impl DatabasePanel {
             })
             .unwrap_or_default();
 
+        let workspace_handle = workspace.clone();
         workspace.update_in(&mut cx, move |_, _, cx| {
             cx.new(|cx| Self {
+                workspace: workspace_handle,
                 focus_handle: cx.focus_handle(),
                 position: DockPosition::Right,
                 active: false,
                 registry,
+                connection_states: HashMap::default(),
             })
         })
     }
 
-    fn add_connection(&mut self, driver: DatabaseDriver, cx: &mut Context<Self>) {
+    fn new_connection_profile(&self, driver: DatabaseDriver) -> ConnectionProfile {
         let base_name = format!("Local {driver}");
         let matching_connections = self
             .registry
@@ -81,18 +96,60 @@ impl DatabasePanel {
             format!("{base_name} {}", matching_connections + 1)
         };
 
+        ConnectionProfile::new(name, driver)
+    }
+
+    fn open_connection_editor(
+        &mut self,
+        profile: ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            log::error!("database panel workspace was dropped");
+            return;
+        };
+        let panel = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                ConnectionEditorModal::new(panel, profile, window, cx)
+            });
+        });
+    }
+
+    pub(crate) fn upsert_connection(&mut self, profile: ConnectionProfile, cx: &mut Context<Self>) {
         self.registry
-            .add(ConnectionProfile::new(name, driver))
-            .expect("the generated connection profile should be valid");
+            .upsert(profile)
+            .expect("the editor validates profiles before saving");
         self.persist(cx);
         cx.notify();
     }
 
+    pub(crate) fn set_connection_state(
+        &mut self,
+        id: ConnectionId,
+        state: ConnectionState,
+        cx: &mut Context<Self>,
+    ) {
+        self.connection_states.insert(id, state);
+        cx.notify();
+    }
+
     fn remove_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
-        self.registry
-            .connections
-            .retain(|connection| connection.id != id);
+        self.registry.remove(id);
+        self.connection_states.remove(&id);
         self.persist(cx);
+        let credential_key = id.credential_key();
+        let credentials_provider = zed_credentials_provider::global(cx);
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = credentials_provider
+                .delete_credentials(&credential_key, cx)
+                .await
+            {
+                log::error!("failed to remove database credentials: {error:#}");
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -127,7 +184,7 @@ impl DatabasePanel {
             )
             .child(Label::new("No database connections").color(Color::Muted))
             .child(
-                Label::new("Choose a driver above to create a local draft")
+                Label::new("Choose a driver above to configure a connection")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
@@ -141,8 +198,9 @@ impl DatabasePanel {
         Button::new(format!("add-{driver:?}"), driver.display_name())
             .style(ButtonStyle::OutlinedGhost)
             .label_size(LabelSize::Small)
-            .on_click(cx.listener(move |panel, _, _, cx| {
-                panel.add_connection(driver, cx);
+            .on_click(cx.listener(move |panel, _, window, cx| {
+                let profile = panel.new_connection_profile(driver);
+                panel.open_connection_editor(profile, window, cx);
             }))
     }
 
@@ -152,36 +210,67 @@ impl DatabasePanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = profile.id;
-        ListItem::new(profile.id.to_string()).inset(true).child(
-            h_flex()
-                .w_full()
-                .gap_2()
-                .child(
-                    Icon::new(IconName::DatabaseZap)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .flex_1()
-                        .child(Label::new(profile.name).truncate())
-                        .child(
-                            Label::new(profile.jdbc_url)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
+        let connection_state = self.connection_states.get(&id).cloned();
+        ListItem::new(profile.id.to_string())
+            .inset(true)
+            .on_click({
+                let profile = profile.clone();
+                cx.listener(move |panel, _, window, cx| {
+                    panel.open_connection_editor(profile.clone(), window, cx);
+                })
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::DatabaseZap)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(Label::new(profile.name.clone()).truncate())
+                            .child(
+                                Label::new(profile.jdbc_url.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .when_some(connection_state, |this, state| match state {
+                        ConnectionState::Connected => this.child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Success),
                         ),
-                )
-                .child(
-                    IconButton::new(format!("remove-{id}"), IconName::Trash)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Remove connection"))
-                        .on_click(cx.listener(move |panel, _, _, cx| {
-                            panel.remove_connection(id, cx);
-                        })),
-                ),
-        )
+                        ConnectionState::Error => this.child(
+                            Icon::new(IconName::XCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Error),
+                        ),
+                    })
+                    .child(
+                        IconButton::new(format!("edit-{id}"), IconName::Pencil)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Edit connection"))
+                            .on_click(cx.listener(move |panel, _, window, cx| {
+                                cx.stop_propagation();
+                                panel.open_connection_editor(profile.clone(), window, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new(format!("remove-{id}"), IconName::Trash)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Remove connection"))
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                cx.stop_propagation();
+                                panel.remove_connection(id, cx);
+                            })),
+                    ),
+            )
     }
 }
 

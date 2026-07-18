@@ -5,6 +5,10 @@ use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod sidecar;
+
+pub use sidecar::{ConnectionTestResult, test_connection};
+
 /// Version of the serialized connection registry.
 pub const CONNECTION_REGISTRY_VERSION: u32 = 1;
 
@@ -16,6 +20,10 @@ pub struct ConnectionId(Uuid);
 impl ConnectionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    pub fn credential_key(self) -> String {
+        format!("zed-database://connections/{self}")
     }
 }
 
@@ -57,6 +65,15 @@ impl DatabaseDriver {
             Self::MySql => "jdbc:mysql://localhost:3306/mysql",
             Self::ClickHouse => "jdbc:clickhouse://localhost:8123/default",
             Self::Sqlite => "jdbc:sqlite:database.sqlite",
+        }
+    }
+
+    pub fn jdbc_url_prefix(self) -> &'static str {
+        match self {
+            Self::PostgreSql => "jdbc:postgresql:",
+            Self::MySql => "jdbc:mysql:",
+            Self::ClickHouse => "jdbc:clickhouse:",
+            Self::Sqlite => "jdbc:sqlite:",
         }
     }
 }
@@ -128,6 +145,13 @@ impl ConnectionProfile {
         if !self.jdbc_url.trim().starts_with("jdbc:") {
             return Err(ConnectionProfileError::InvalidJdbcUrl);
         }
+        if !self
+            .jdbc_url
+            .trim()
+            .starts_with(self.driver.jdbc_url_prefix())
+        {
+            return Err(ConnectionProfileError::DriverUrlMismatch(self.driver));
+        }
         Ok(())
     }
 }
@@ -138,6 +162,8 @@ pub enum ConnectionProfileError {
     MissingName,
     #[error("connection URL must start with `jdbc:`")]
     InvalidJdbcUrl,
+    #[error("connection URL does not match the {0} JDBC driver")]
+    DriverUrlMismatch(DatabaseDriver),
 }
 
 /// Versioned payload persisted by the database panel.
@@ -152,6 +178,27 @@ impl ConnectionRegistry {
         profile.validate()?;
         self.connections.push(profile);
         Ok(())
+    }
+
+    pub fn upsert(&mut self, profile: ConnectionProfile) -> Result<(), ConnectionProfileError> {
+        profile.validate()?;
+        match self
+            .connections
+            .iter_mut()
+            .find(|connection| connection.id == profile.id)
+        {
+            Some(connection) => *connection = profile,
+            None => self.connections.push(profile),
+        }
+        Ok(())
+    }
+
+    pub fn remove(&mut self, id: ConnectionId) -> Option<ConnectionProfile> {
+        let index = self
+            .connections
+            .iter()
+            .position(|connection| connection.id == id)?;
+        Some(self.connections.remove(index))
     }
 }
 
@@ -209,6 +256,14 @@ mod tests {
             profile.validate(),
             Err(ConnectionProfileError::InvalidJdbcUrl)
         );
+
+        profile.jdbc_url = "jdbc:mysql://localhost/mysql".to_owned();
+        assert_eq!(
+            profile.validate(),
+            Err(ConnectionProfileError::DriverUrlMismatch(
+                DatabaseDriver::PostgreSql
+            ))
+        );
     }
 
     #[test]
@@ -225,5 +280,20 @@ mod tests {
         let decoded = serde_json::from_str::<ConnectionRegistry>(&json).unwrap();
 
         assert_eq!(decoded, registry);
+    }
+
+    #[test]
+    fn registry_upserts_and_removes_profiles() {
+        let mut registry = ConnectionRegistry::default();
+        let mut profile = ConnectionProfile::new("Local", DatabaseDriver::Sqlite);
+        let id = profile.id;
+        registry.upsert(profile.clone()).unwrap();
+
+        profile.name = "Renamed".to_owned();
+        registry.upsert(profile.clone()).unwrap();
+
+        assert_eq!(registry.connections, vec![profile.clone()]);
+        assert_eq!(registry.remove(id), Some(profile));
+        assert!(registry.connections.is_empty());
     }
 }
