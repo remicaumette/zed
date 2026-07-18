@@ -1,53 +1,119 @@
-use anyhow::{Context as _, Result};
-use database::{ConnectionProfile, QueryResult, execute_query};
+use crate::{DatabasePanel, DatabaseResultsPanel, results_panel::StatementExecution};
+use anyhow::{Context as _, Result, anyhow};
+use database::{
+    ConnectionProfile, ConsoleId, QueryConsole, execute_query, split_sql_statements,
+    sql_statement_at_offset,
+};
+use editor::{Editor, EditorEvent, EditorMode};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, Task, Window,
-    px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, Subscription,
+    Task, WeakEntity, Window, px,
 };
+use language::Buffer;
+use multi_buffer::{MultiBuffer, MultiBufferOffset};
+use std::path::Path;
 use ui::{
-    Banner, Button, ButtonStyle, Color, Icon, IconName, Label, LabelSize, Severity, Table,
-    prelude::*,
+    Banner, Button, ButtonStyle, Color, Icon, IconName, Label, LabelSize, Severity, prelude::*,
 };
-use ui_input::InputField;
 use workspace::{Item, Workspace};
 
 const CONSOLE_MAX_ROWS: u32 = 200;
 
-pub(crate) struct DatabaseConsole {
-    profile: ConnectionProfile,
-    sql: Entity<InputField>,
-    status: ConsoleStatus,
-    task: Option<Task<()>>,
+#[derive(Clone, Copy)]
+enum ExecutionTarget {
+    SelectionOrCurrent,
+    All,
 }
 
-enum ConsoleStatus {
-    Idle,
-    Running,
-    Completed(QueryResult),
-    Error(String),
+pub(crate) struct DatabaseConsole {
+    workspace: WeakEntity<Workspace>,
+    profile: ConnectionProfile,
+    console_id: ConsoleId,
+    console_name: String,
+    editor: Entity<Editor>,
+    is_running: bool,
+    error: Option<String>,
+    task: Option<Task<()>>,
+    _language_task: Task<()>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DatabaseConsole {
     pub(crate) fn new(
+        workspace: WeakEntity<Workspace>,
+        panel: WeakEntity<DatabasePanel>,
         profile: ConnectionProfile,
+        console: QueryConsole,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let sql = cx.new(|cx| {
-            let input = InputField::new(window, cx, "Enter a SQL statement…")
-                .label("SQL")
-                .tab_index(0);
-            input.editor().set_multiline(Some(10), window, cx);
-            input.set_text("select 1;", window, cx);
-            input
+        let project = workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().clone());
+        let language_registry = project
+            .as_ref()
+            .map(|project| project.read(cx).languages().clone());
+        let buffer = cx.new(|cx| {
+            let buffer = Buffer::local(console.sql.clone(), cx);
+            if let Some(language_registry) = &language_registry {
+                buffer.set_language_registry(language_registry.clone());
+            }
+            buffer
+        });
+        let multi_buffer = cx
+            .new(|cx| MultiBuffer::singleton(buffer.clone(), cx).with_title(console.name.clone()));
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(EditorMode::full(), multi_buffer, project, window, cx);
+            editor.set_placeholder_text("Write one or more SQL statements…", window, cx);
+            editor.set_show_runnables(false, cx);
+            editor.set_use_modal_editing(true);
+            editor
         });
 
+        let console_id = console.id;
+        let subscription = cx.subscribe(&editor, move |_, editor, event, cx| {
+            if matches!(event, EditorEvent::Edited { .. }) {
+                let sql = editor.read(cx).text(cx);
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.update_console_sql(console_id, sql, cx)
+                    })
+                    .ok();
+            }
+        });
+
+        let console_name = console.name.clone();
+        let language_task = if let Some(language_registry) = language_registry {
+            let language_path = console.name.clone();
+            cx.spawn(async move |_, cx| {
+                let Ok(language) = language_registry
+                    .load_language_for_file_path(Path::new(&language_path))
+                    .await
+                else {
+                    return;
+                };
+                buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+            })
+        } else {
+            Task::ready(())
+        };
+
         Self {
+            workspace,
             profile,
-            sql,
-            status: ConsoleStatus::Idle,
+            console_id,
+            console_name,
+            editor,
+            is_running: false,
+            error: None,
             task: None,
+            _language_task: language_task,
+            _subscriptions: vec![subscription],
         }
+    }
+
+    pub(crate) fn console_id(&self) -> ConsoleId {
+        self.console_id
     }
 
     async fn saved_password(
@@ -64,138 +130,139 @@ impl DatabaseConsole {
             .transpose()
     }
 
-    fn execute(&mut self, cx: &mut Context<Self>) {
-        let sql = self.sql.read(cx).text(cx);
-        if sql.trim().is_empty() {
-            self.status = ConsoleStatus::Error("Enter a SQL statement to run".to_owned());
+    fn statements_for_execution(
+        &self,
+        target: ExecutionTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<String>> {
+        let (sql, selection) = self.editor.update(cx, |editor, cx| {
+            let sql = editor.text(cx);
+            let display_snapshot = editor.display_snapshot(cx);
+            let selection = editor
+                .selections
+                .newest::<MultiBufferOffset>(&display_snapshot);
+            (sql, selection)
+        });
+
+        let ranges = match target {
+            ExecutionTarget::All => split_sql_statements(&sql),
+            ExecutionTarget::SelectionOrCurrent if !selection.is_empty() => {
+                let selection = selection.range();
+                let start = selection.start.0.min(sql.len());
+                let end = selection.end.0.min(sql.len());
+                let selected_sql = sql
+                    .get(start..end)
+                    .ok_or_else(|| anyhow!("The SQL selection is not on valid text boundaries"))?;
+                return statements_from_text(selected_sql);
+            }
+            ExecutionTarget::SelectionOrCurrent => {
+                sql_statement_at_offset(&sql, selection.head().0)
+                    .into_iter()
+                    .collect()
+            }
+        };
+
+        let statements = ranges
+            .into_iter()
+            .filter_map(|range| sql.get(range).map(str::to_owned))
+            .collect::<Vec<_>>();
+        if statements.is_empty() {
+            return Err(anyhow!("No executable SQL statement found"));
+        }
+        Ok(statements)
+    }
+
+    fn results_panel(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<DatabaseResultsPanel>> {
+        let workspace = self.workspace.upgrade()?;
+        let results_panel = workspace.read(cx).panel::<DatabaseResultsPanel>(cx)?;
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_panel::<DatabaseResultsPanel>(window, cx)
+        });
+        Some(results_panel)
+    }
+
+    fn execute(&mut self, target: ExecutionTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let statements = match self.statements_for_execution(target, cx) {
+            Ok(statements) => statements,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let Some(results_panel) = self.results_panel(window, cx) else {
+            self.error = Some("The database results panel is not available".to_owned());
             cx.notify();
             return;
-        }
+        };
 
         let profile = self.profile.clone();
+        let console_name = self.console_name.clone();
         let credentials_provider = zed_credentials_provider::global(cx);
-        self.status = ConsoleStatus::Running;
+        results_panel.update(cx, |panel, cx| {
+            panel.start(console_name.clone(), statements.len(), cx)
+        });
+        self.is_running = true;
+        self.error = None;
         cx.notify();
 
         self.task = Some(cx.spawn(async move |this, cx| {
-            let result = async {
-                let password =
-                    Self::saved_password(&profile, credentials_provider.as_ref(), cx).await?;
-                execute_query(&profile, password.as_deref(), &sql, CONSOLE_MAX_ROWS).await
+            let password = Self::saved_password(&profile, credentials_provider.as_ref(), cx).await;
+            let mut executions = Vec::with_capacity(statements.len());
+            match password {
+                Ok(password) => {
+                    for statement in statements {
+                        let result = execute_query(
+                            &profile,
+                            password.as_deref(),
+                            &statement,
+                            CONSOLE_MAX_ROWS,
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                        executions.push(StatementExecution { statement, result });
+                    }
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    executions.extend(statements.into_iter().map(|statement| StatementExecution {
+                        statement,
+                        result: Err(error.clone()),
+                    }));
+                }
             }
-            .await;
 
+            results_panel.update(cx, |panel, cx| panel.complete(console_name, executions, cx));
             this.update(cx, |this, cx| {
-                this.status = match result {
-                    Ok(result) => ConsoleStatus::Completed(result),
-                    Err(error) => ConsoleStatus::Error(error.to_string()),
-                };
+                this.is_running = false;
                 cx.notify();
             })
             .ok();
         }));
     }
+}
 
-    fn render_completed(result: &QueryResult, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let summary = if let Some(affected_rows) = result.affected_rows {
-            format!(
-                "{affected_rows} row{} affected in {} ms",
-                if affected_rows == 1 { "" } else { "s" },
-                result.elapsed_millis
-            )
-        } else {
-            format!(
-                "{} row{} returned in {} ms",
-                result.rows.len(),
-                if result.rows.len() == 1 { "" } else { "s" },
-                result.elapsed_millis
-            )
-        };
-
-        let status = h_flex()
-            .min_h(px(32.))
-            .flex_none()
-            .gap_2()
-            .px_3()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(Label::new(summary).size(LabelSize::Small))
-            .when(result.truncated, |this| {
-                this.child(
-                    Label::new(format!("Result truncated at {CONSOLE_MAX_ROWS} rows"))
-                        .size(LabelSize::Small)
-                        .color(Color::Warning),
-                )
-            });
-
-        if result.columns.is_empty() {
-            return v_flex()
-                .size_full()
-                .child(status)
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .child(Label::new("Statement completed").color(Color::Muted)),
-                )
-                .into_any_element();
-        }
-
-        let column_count = result.columns.len();
-        let headers = result
-            .columns
-            .iter()
-            .map(|column| {
-                v_flex()
-                    .min_w_0()
-                    .child(Label::new(column.label.clone()).truncate())
-                    .child(
-                        Label::new(column.type_name.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-        let mut table = Table::new(column_count)
-            .width(px((column_count.max(1) * 180) as f32))
-            .header(headers)
-            .striped();
-        for row in &result.rows {
-            table = table.row(
-                row.iter()
-                    .map(|value| match value {
-                        Some(value) => Label::new(value.clone())
-                            .size(LabelSize::Small)
-                            .into_any_element(),
-                        None => Label::new("NULL")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .into_any_element(),
-                    })
-                    .collect(),
-            );
-        }
-
-        v_flex()
-            .size_full()
-            .child(status)
-            .child(
-                div()
-                    .id("database-result-scroll")
-                    .flex_1()
-                    .overflow_scroll()
-                    .child(table),
-            )
-            .into_any_element()
+fn statements_from_text(sql: &str) -> Result<Vec<String>> {
+    let statements = split_sql_statements(sql)
+        .into_iter()
+        .filter_map(|range| sql.get(range).map(str::to_owned))
+        .collect::<Vec<_>>();
+    if statements.is_empty() {
+        Err(anyhow!(
+            "No executable SQL statement found in the selection"
+        ))
+    } else {
+        Ok(statements)
     }
 }
 
 impl Focusable for DatabaseConsole {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.sql.focus_handle(cx)
+        self.editor.focus_handle(cx)
     }
 }
 
@@ -205,11 +272,15 @@ impl Item for DatabaseConsole {
     type Event = ();
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> gpui::SharedString {
-        format!("{} Console", self.profile.name).into()
+        self.console_name.clone().into()
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::Terminal))
+        Some(Icon::new(IconName::FileDoc))
+    }
+
+    fn tab_tooltip_text(&self, _cx: &App) -> Option<gpui::SharedString> {
+        Some(format!("{} · {}", self.profile.name, self.console_name).into())
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -226,18 +297,16 @@ impl Item for DatabaseConsole {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.sql.focus_handle(cx), cx);
+        window.focus(&self.editor.focus_handle(cx), cx);
     }
 }
 
 impl Render for DatabaseConsole {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_running = matches!(self.status, ConsoleStatus::Running);
-
         v_flex()
             .id("database-console")
             .key_context("DatabaseConsole")
-            .track_focus(&self.sql.focus_handle(cx))
+            .track_focus(&self.editor.focus_handle(cx))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(
@@ -251,9 +320,15 @@ impl Render for DatabaseConsole {
                     .border_color(cx.theme().colors().border)
                     .child(
                         h_flex()
+                            .min_w_0()
                             .gap_2()
                             .child(Icon::new(IconName::DatabaseZap).color(Color::Muted))
-                            .child(Label::new(self.profile.name.clone()))
+                            .child(Label::new(self.profile.name.clone()).truncate())
+                            .child(
+                                Label::new(self.console_name.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
                             .when(self.profile.read_only, |this| {
                                 this.child(
                                     Label::new("Read-only")
@@ -263,50 +338,46 @@ impl Render for DatabaseConsole {
                             }),
                     )
                     .child(
-                        Button::new(
-                            "run-database-query",
-                            if is_running { "Running…" } else { "Run" },
-                        )
-                        .style(ButtonStyle::Filled)
-                        .start_icon(Icon::new(IconName::PlayFilled))
-                        .disabled(is_running)
-                        .on_click(cx.listener(|this, _, _, cx| this.execute(cx))),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new(
+                                    "run-selected-database-query",
+                                    "Run Selection / Current",
+                                )
+                                .style(ButtonStyle::Filled)
+                                .start_icon(Icon::new(IconName::PlayFilled))
+                                .disabled(self.is_running)
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.execute(
+                                            ExecutionTarget::SelectionOrCurrent,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new("run-all-database-queries", "Run All")
+                                    .style(ButtonStyle::Outlined)
+                                    .disabled(self.is_running)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.execute(ExecutionTarget::All, window, cx)
+                                    })),
+                            ),
                     ),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(self.sql.clone()),
-            )
-            .child(match &self.status {
-                ConsoleStatus::Idle => v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(Label::new("Run a statement to see its result").color(Color::Muted))
-                    .into_any_element(),
-                ConsoleStatus::Running => v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(Label::new("Executing query…").color(Color::Muted))
-                    .into_any_element(),
-                ConsoleStatus::Completed(result) => {
-                    Self::render_completed(result, cx).into_any_element()
-                }
-                ConsoleStatus::Error(error) => v_flex()
-                    .flex_1()
-                    .p_3()
-                    .child(
+            .when_some(self.error.clone(), |this, error| {
+                this.child(
+                    div().flex_none().p_2().child(
                         Banner::new()
                             .severity(Severity::Error)
                             .wrap_content(true)
-                            .child(Label::new(error.clone()).size(LabelSize::Small)),
-                    )
-                    .into_any_element(),
+                            .child(Label::new(error).size(LabelSize::Small)),
+                    ),
+                )
             })
+            .child(div().flex_1().min_h_0().child(self.editor.clone()))
     }
 }

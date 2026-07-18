@@ -1,15 +1,24 @@
 mod connection_editor;
 mod console;
+mod results_panel;
 
 use connection_editor::ConnectionEditorModal;
 use console::DatabaseConsole;
-use database::{ConnectionId, ConnectionProfile, ConnectionRegistry, DatabaseDriver};
+use database::{
+    ConnectionId, ConnectionProfile, ConnectionRegistry, ConsoleId, ConsoleRegistry,
+    DatabaseDriver, QueryConsole,
+};
 use db::kvp::KeyValueStore;
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, Pixels, Render, StatefulInteractiveElement, WeakEntity, Window, px,
+    Focusable, IntoElement, Pixels, Render, StatefulInteractiveElement, Task, WeakEntity, Window,
+    px,
 };
-use std::collections::HashMap;
+pub use results_panel::DatabaseResultsPanel;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use ui::{
     Button, ButtonStyle, Color, Icon, IconButton, IconName, IconSize, Label, LabelSize, ListItem,
     Tooltip, prelude::*,
@@ -18,7 +27,7 @@ use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-use zed_actions::database_panel::{Toggle, ToggleFocus};
+use zed_actions::database_panel::{Toggle, ToggleFocus, ToggleResults, ToggleResultsFocus};
 
 const DATABASE_PANEL_KEY: &str = "DatabasePanel";
 const CONNECTIONS_STORAGE_KEY: &str = "database-viewer-connections-v1";
@@ -33,6 +42,14 @@ pub fn init(cx: &mut App) {
                 workspace.close_panel::<DatabasePanel>(window, cx);
             }
         });
+        workspace.register_action(|workspace, _: &ToggleResultsFocus, window, cx| {
+            workspace.toggle_panel_focus::<DatabaseResultsPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleResults, window, cx| {
+            if !workspace.toggle_panel_focus::<DatabaseResultsPanel>(window, cx) {
+                workspace.close_panel::<DatabaseResultsPanel>(window, cx);
+            }
+        });
     })
     .detach();
 }
@@ -43,7 +60,11 @@ pub struct DatabasePanel {
     position: DockPosition,
     active: bool,
     registry: ConnectionRegistry,
+    console_registry: ConsoleRegistry,
+    console_storage_key: Option<String>,
+    expanded_connections: HashSet<ConnectionId>,
     connection_states: HashMap<ConnectionId, ConnectionState>,
+    pending_console_persist: Task<()>,
 }
 
 #[derive(Clone)]
@@ -71,6 +92,31 @@ impl DatabasePanel {
             })
             .unwrap_or_default();
 
+        let console_storage_key = workspace
+            .read_with(&cx, |workspace, _| Self::console_storage_key(workspace))
+            .ok()
+            .flatten();
+        let console_registry = if let Some(storage_key) = console_storage_key.clone() {
+            let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
+            cx.background_spawn(async move { kvp.read_kvp(&storage_key) })
+                .await?
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .unwrap_or_else(|error| {
+                    log::error!("failed to load database consoles: {error:#}");
+                    None
+                })
+                .unwrap_or_default()
+        } else {
+            ConsoleRegistry::default()
+        };
+        let expanded_connections = console_registry
+            .consoles
+            .iter()
+            .map(|console| console.connection_id)
+            .collect();
+
         let workspace_handle = workspace.clone();
         workspace.update_in(&mut cx, move |_, _, cx| {
             cx.new(|cx| Self {
@@ -79,9 +125,22 @@ impl DatabasePanel {
                 position: DockPosition::Right,
                 active: false,
                 registry,
+                console_registry,
+                console_storage_key,
+                expanded_connections,
                 connection_states: HashMap::default(),
+                pending_console_persist: Task::ready(()),
             })
         })
+    }
+
+    fn console_storage_key(workspace: &Workspace) -> Option<String> {
+        workspace
+            .database_id()
+            .map(i64::from)
+            .map(|id| id.to_string())
+            .or_else(|| workspace.session_id())
+            .map(|id| format!("database-viewer-consoles-v1-{id}"))
     }
 
     fn new_connection_profile(&self) -> ConnectionProfile {
@@ -121,9 +180,41 @@ impl DatabasePanel {
         });
     }
 
+    fn create_console(
+        &mut self,
+        profile: ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut index = 1;
+        let name = loop {
+            let name = if index == 1 {
+                "console.sql".to_owned()
+            } else {
+                format!("console-{index}.sql")
+            };
+            if !self
+                .console_registry
+                .consoles
+                .iter()
+                .any(|console| console.connection_id == profile.id && console.name == name)
+            {
+                break name;
+            }
+            index += 1;
+        };
+        let mut console = QueryConsole::new(profile.id, name);
+        console.sql = format!("-- {}\n\n", profile.name);
+        self.console_registry.upsert(console.clone());
+        self.expanded_connections.insert(profile.id);
+        self.persist_consoles(cx);
+        self.open_console(profile, console, window, cx);
+    }
+
     fn open_console(
         &mut self,
         profile: ConnectionProfile,
+        console: QueryConsole,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -131,9 +222,70 @@ impl DatabasePanel {
             log::error!("database panel workspace was dropped");
             return;
         };
+        let workspace_handle = self.workspace.clone();
+        let panel = cx.weak_entity();
         workspace.update(cx, |workspace, cx| {
-            let console = cx.new(|cx| DatabaseConsole::new(profile, window, cx));
+            let existing = workspace.panes().iter().find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<DatabaseConsole>())
+                    .find(|item| item.read(cx).console_id() == console.id)
+            });
+            if let Some(existing) = existing {
+                workspace.activate_item(&existing, true, true, window, cx);
+                return;
+            }
+
+            let console = cx.new(|cx| {
+                DatabaseConsole::new(workspace_handle, panel, profile, console, window, cx)
+            });
             workspace.add_item_to_active_pane(Box::new(console), None, true, window, cx);
+        });
+    }
+
+    pub(crate) fn update_console_sql(
+        &mut self,
+        id: ConsoleId,
+        sql: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(console) = self
+            .console_registry
+            .consoles
+            .iter_mut()
+            .find(|console| console.id == id)
+        else {
+            return;
+        };
+        if console.sql == sql {
+            return;
+        }
+        console.sql = sql;
+        self.persist_consoles(cx);
+    }
+
+    fn toggle_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if !self.expanded_connections.remove(&id) {
+            self.expanded_connections.insert(id);
+        }
+        cx.notify();
+    }
+
+    fn persist_consoles(&mut self, cx: &mut Context<Self>) {
+        let Some(storage_key) = self.console_storage_key.clone() else {
+            return;
+        };
+        let Ok(serialized) = serde_json::to_string(&self.console_registry) else {
+            log::error!("failed to serialize database consoles");
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        let executor = cx.background_executor().clone();
+        self.pending_console_persist = cx.spawn(async move |_, _| {
+            executor.timer(Duration::from_millis(150)).await;
+            if let Err(error) = kvp.write_kvp(storage_key, serialized).await {
+                log::error!("failed to save database consoles: {error:#}");
+            }
         });
     }
 
@@ -157,8 +309,13 @@ impl DatabasePanel {
 
     fn remove_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         self.registry.remove(id);
+        self.console_registry
+            .consoles
+            .retain(|console| console.connection_id != id);
+        self.expanded_connections.remove(&id);
         self.connection_states.remove(&id);
         self.persist(cx);
+        self.persist_consoles(cx);
         let credential_key = id.credential_key();
         let credentials_provider = zed_credentials_provider::global(cx);
         cx.spawn(async move |_, cx| {
@@ -227,77 +384,127 @@ impl DatabasePanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = profile.id;
+        let expanded = self.expanded_connections.contains(&id);
+        let consoles = self
+            .console_registry
+            .consoles
+            .iter()
+            .filter(|console| console.connection_id == id)
+            .cloned()
+            .collect::<Vec<_>>();
         let connection_state = self.connection_states.get(&id).cloned();
-        ListItem::new(profile.id.to_string())
-            .inset(true)
-            .on_click({
-                let profile = profile.clone();
-                cx.listener(move |panel, _, window, cx| {
-                    panel.open_connection_editor(profile.clone(), false, window, cx);
-                })
-            })
+        v_flex()
+            .w_full()
             .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
+                ListItem::new(profile.id.to_string())
+                    .inset(true)
+                    .on_click(cx.listener(move |panel, _, _, cx| panel.toggle_connection(id, cx)))
                     .child(
-                        Icon::new(IconName::DatabaseZap)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .child(Label::new(profile.name.clone()).truncate())
+                        h_flex()
+                            .w_full()
+                            .gap_2()
                             .child(
-                                Label::new(profile.jdbc_url.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate(),
+                                Icon::new(if expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .child(
+                                Icon::new(IconName::DatabaseZap)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(Label::new(profile.name.clone()).truncate())
+                                    .child(
+                                        Label::new(profile.jdbc_url.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    ),
+                            )
+                            .when_some(connection_state, |this, state| match state {
+                                ConnectionState::Connected => this.child(
+                                    Icon::new(IconName::Check)
+                                        .size(IconSize::Small)
+                                        .color(Color::Success),
+                                ),
+                                ConnectionState::Error => this.child(
+                                    Icon::new(IconName::XCircle)
+                                        .size(IconSize::Small)
+                                        .color(Color::Error),
+                                ),
+                            })
+                            .child({
+                                let profile = profile.clone();
+                                IconButton::new(format!("new-console-{id}"), IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("New query console"))
+                                    .on_click(cx.listener(move |panel, _, window, cx| {
+                                        cx.stop_propagation();
+                                        panel.create_console(profile.clone(), window, cx);
+                                    }))
+                            })
+                            .child({
+                                let profile = profile.clone();
+                                IconButton::new(format!("edit-{id}"), IconName::Pencil)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Edit connection"))
+                                    .on_click(cx.listener(move |panel, _, window, cx| {
+                                        cx.stop_propagation();
+                                        panel.open_connection_editor(
+                                            profile.clone(),
+                                            false,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                            })
+                            .child(
+                                IconButton::new(format!("remove-{id}"), IconName::Trash)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Remove connection"))
+                                    .on_click(cx.listener(move |panel, _, _, cx| {
+                                        cx.stop_propagation();
+                                        panel.remove_connection(id, cx);
+                                    })),
                             ),
-                    )
-                    .when_some(connection_state, |this, state| match state {
-                        ConnectionState::Connected => this.child(
-                            Icon::new(IconName::Check)
-                                .size(IconSize::Small)
-                                .color(Color::Success),
-                        ),
-                        ConnectionState::Error => this.child(
-                            Icon::new(IconName::XCircle)
-                                .size(IconSize::Small)
-                                .color(Color::Error),
-                        ),
-                    })
-                    .child({
-                        let profile = profile.clone();
-                        IconButton::new(format!("console-{id}"), IconName::Terminal)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Open query console"))
-                            .on_click(cx.listener(move |panel, _, window, cx| {
-                                cx.stop_propagation();
-                                panel.open_console(profile.clone(), window, cx);
-                            }))
-                    })
-                    .child({
-                        IconButton::new(format!("edit-{id}"), IconName::Pencil)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Edit connection"))
-                            .on_click(cx.listener(move |panel, _, window, cx| {
-                                cx.stop_propagation();
-                                panel.open_connection_editor(profile.clone(), false, window, cx);
-                            }))
-                    })
-                    .child(
-                        IconButton::new(format!("remove-{id}"), IconName::Trash)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Remove connection"))
-                            .on_click(cx.listener(move |panel, _, _, cx| {
-                                cx.stop_propagation();
-                                panel.remove_connection(id, cx);
-                            })),
                     ),
             )
+            .when(expanded, |this| {
+                this.children(consoles.into_iter().map(|console| {
+                    let profile = profile.clone();
+                    let console_for_open = console.clone();
+                    ListItem::new(console.id.to_string())
+                        .inset(true)
+                        .indent_level(1)
+                        .on_click(cx.listener(move |panel, _, window, cx| {
+                            panel.open_console(
+                                profile.clone(),
+                                console_for_open.clone(),
+                                window,
+                                cx,
+                            );
+                        }))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::FileDoc)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(console.name).truncate()),
+                        )
+                }))
+            })
     }
 }
 

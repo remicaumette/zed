@@ -7,14 +7,17 @@ use uuid::Uuid;
 
 mod driver_manager;
 mod sidecar;
+mod sql;
 
 pub use driver_manager::{
     JdbcDriverDownload, download_jdbc_driver, installed_jdbc_driver_path, resolve_jdbc_driver_path,
 };
 pub use sidecar::{ConnectionTestResult, QueryColumn, QueryResult, execute_query, test_connection};
+pub use sql::{split_sql_statements, sql_statement_at_offset};
 
 /// Version of the serialized connection registry.
 pub const CONNECTION_REGISTRY_VERSION: u32 = 1;
+pub const CONSOLE_REGISTRY_VERSION: u32 = 1;
 
 /// Stable identity for a saved database connection.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -38,6 +41,29 @@ impl Default for ConnectionId {
 }
 
 impl fmt::Display for ConnectionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Stable identity for a workspace-local SQL console.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConsoleId(Uuid);
+
+impl ConsoleId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ConsoleId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ConsoleId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
@@ -222,6 +248,60 @@ impl Default for ConnectionRegistry {
     }
 }
 
+/// A virtual `.sql` file stored for one connection in one Zed workspace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryConsole {
+    pub id: ConsoleId,
+    pub connection_id: ConnectionId,
+    pub name: String,
+    pub sql: String,
+}
+
+impl QueryConsole {
+    pub fn new(connection_id: ConnectionId, name: impl Into<String>) -> Self {
+        Self {
+            id: ConsoleId::new(),
+            connection_id,
+            name: name.into(),
+            sql: String::new(),
+        }
+    }
+}
+
+/// Versioned workspace-local collection of virtual SQL files.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConsoleRegistry {
+    pub version: u32,
+    pub consoles: Vec<QueryConsole>,
+}
+
+impl ConsoleRegistry {
+    pub fn upsert(&mut self, console: QueryConsole) {
+        match self
+            .consoles
+            .iter_mut()
+            .find(|existing| existing.id == console.id)
+        {
+            Some(existing) => *existing = console,
+            None => self.consoles.push(console),
+        }
+    }
+
+    pub fn remove(&mut self, id: ConsoleId) -> Option<QueryConsole> {
+        let index = self.consoles.iter().position(|console| console.id == id)?;
+        Some(self.consoles.remove(index))
+    }
+}
+
+impl Default for ConsoleRegistry {
+    fn default() -> Self {
+        Self {
+            version: CONSOLE_REGISTRY_VERSION,
+            consoles: Vec::new(),
+        }
+    }
+}
+
 /// Object kinds exposed by the lazy metadata tree.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -337,5 +417,25 @@ mod tests {
         assert_eq!(registry.connections, vec![profile.clone()]);
         assert_eq!(registry.remove(id), Some(profile));
         assert!(registry.connections.is_empty());
+    }
+
+    #[test]
+    fn console_registry_round_trips_and_upserts_virtual_files() {
+        let connection_id = ConnectionId::new();
+        let mut console = QueryConsole::new(connection_id, "console.sql");
+        let console_id = console.id;
+        let mut registry = ConsoleRegistry::default();
+        registry.upsert(console.clone());
+
+        console.sql = "select 1;".to_owned();
+        registry.upsert(console.clone());
+
+        let serialized = serde_json::to_string(&registry).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConsoleRegistry>(&serialized).unwrap(),
+            registry
+        );
+        assert_eq!(registry.consoles, vec![console.clone()]);
+        assert_eq!(registry.remove(console_id), Some(console));
     }
 }

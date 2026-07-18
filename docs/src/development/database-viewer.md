@@ -15,8 +15,9 @@ The first supported databases are PostgreSQL, MySQL, ClickHouse, and SQLite.
 
 Last updated: July 18, 2026.
 
-The project now spans milestones 0, 1, and the first vertical slice of milestone 3. Connection profiles can be edited and tested against a real database, and a
-saved connection can open a native SQL console backed by the JDBC sidecar.
+The project now spans milestones 0, 1, and the first vertical slice of milestone 3. Connection profiles can be edited and tested against a real database. Each
+saved connection can own multiple workspace-local SQL consoles backed by Zed's
+native editor and the JDBC sidecar.
 
 - [x] Add versioned connection profile types.
 - [x] Validate JDBC URLs without storing secrets in the profile.
@@ -29,8 +30,11 @@ saved connection can open a native SQL console backed by the JDBC sidecar.
 - [x] Download missing built-in drivers on demand with SHA-256 verification.
 - [x] Accept a user-provided JAR for custom JDBC connections.
 - [x] Select the database driver inside a single New Connection dialog.
-- [x] Open a SQL console tab from a saved connection.
-- [x] Execute one JDBC statement and display bounded rows or an affected-row count.
+- [x] Create multiple persistent `.sql` consoles below each saved connection.
+- [x] Edit a console with Zed's native editor and SQL language support when installed.
+- [x] Parse and execute the selection, the current statement, or the whole document.
+- [x] Display one result tab per executed statement in a dedicated bottom panel.
+- [x] Display bounded rows, affected-row counts, durations, truncation, and errors.
 - [x] Exercise the complete protocol against a temporary SQLite database.
 - [ ] Run contract tests against PostgreSQL, MySQL, and ClickHouse containers.
 - [ ] Package the sidecar as part of release builds.
@@ -70,9 +74,10 @@ persistent sidecar process are still planned.
 ### Crate boundaries
 
 - `database` owns profiles, object kinds, protocol-facing domain types, and
-  service interfaces. It does not depend on GPUI or Java.
+  service interfaces. It also owns the dialect-neutral statement splitter. It
+  does not depend on GPUI or Java.
 - `database_ui` owns the dock panel, connection editor, object tree, query
-  views, and presentation state.
+  consoles, and the bottom results panel.
 - The Rust driver manager owns verified downloads, installed-driver state, and
   custom JAR paths.
 - The Java module owns generic JDBC connection tests and bounded statement
@@ -96,8 +101,7 @@ builds use Zed's development credential store by default; set
 system keychain.
 
 Connections default to read-only. The JDBC flag is applied during connection
-tests and the future query runner will enforce the same policy before executing
-statements.
+tests and query execution.
 
 ## Driver strategy
 
@@ -169,18 +173,22 @@ containerized databases and a temporary SQLite file.
 
 ### Milestone 3: query console
 
-- [x] Native SQL editor tab associated with a saved connection.
-- [x] Execute a statement and show bounded text results in Zed's table component.
-- Execute selection or statement with cancellation and timeout.
+- [x] Multiple native SQL editor tabs associated with a saved connection.
+- [x] Workspace-local persistence for virtual `.sql` console documents.
+- [x] Lexically split statements across comments and quoted values without
+      coupling the UI to a specific JDBC driver.
+- [x] Execute the selection, current statement, or complete document.
+- [x] Show one bounded result per statement in a dedicated bottom panel.
+- Add cancellation, configurable timeouts, and a shared connection session.
 - Stream bounded result batches into Zed's virtualized table.
-- Display affected rows, duration, warnings, and sanitized errors.
+- Display JDBC warnings and improve sanitized diagnostics.
 
 Exit condition: large results do not block the UI or grow memory without a
 configured bound.
 
 ### Milestone 4: DataGrip-style workflows
 
-- Multiple result tabs and query history.
+- Persistent result tabs and query history across executions.
 - DDL preview, data export, and explain plans.
 - Safe data editing with explicit primary-key requirements.
 - Schema diff and richer database-specific object support.
@@ -221,7 +229,7 @@ protocol mismatch, process crash, and network loss.
 
 ## Manual test checklist
 
-For the current connection-editor and JDBC slice:
+For the current connection-editor, SQL console, and JDBC slice:
 
 1. Run `script/build-database-sidecar`.
 2. Build and launch the development version of Zed.
@@ -232,14 +240,30 @@ For the current connection-editor and JDBC slice:
 7. Keep the generated JDBC URL, or point it at a disposable file.
 8. Change the name and read-only setting, then select **Test Connection**.
 9. Confirm that the success message contains SQLite and JDBC driver versions.
-10. Save the connection, then select its terminal icon to open a query console.
-11. Run `select 42 as answer, null as missing;` and confirm that one result row
-    appears with an `answer` column and a muted `NULL` cell.
-12. Close and reopen Zed, and confirm the profile remains.
-13. Edit the saved profile, enter a password if the target database needs one,
+10. Save the connection, expand it, then select its **+** icon to create
+    `console.sql` as a child item.
+11. Enter the following document in the native SQL editor:
+
+    ```sql
+    select 1 as first;
+    select ';' as quoted_semicolon;
+    select 3 as third;
+    ```
+
+12. Put the cursor in the second statement and select **Run Selection / Current**.
+    Confirm that the bottom Database Results panel opens with one result.
+13. Select the first two statements and run **Run Selection / Current** again.
+    Confirm that the bottom panel contains **Result 1** and **Result 2**.
+14. Select **Run All** and confirm that all three result tabs are available.
+15. Create `console-2.sql` with the connection's **+** icon and confirm both
+    consoles appear as children of the same connection.
+16. Close and reopen Zed with the same workspace. Confirm that the connection,
+    both console names, and their SQL contents remain.
+17. Edit the saved profile, enter a password if the target database needs one,
     save it, then reopen the editor. The password field must remain visually
     empty while **Test Connection** continues to use the stored secret.
-14. Remove the profile, restart Zed, and confirm it stays removed.
+18. Remove the profile, restart Zed, and confirm that it and its consoles stay
+    removed.
 
 Also create a **Custom JDBC** connection, select a local driver JAR with
 **Browse**, and confirm that Zed uses it without copying or downloading it.
@@ -254,9 +278,10 @@ jdbc:clickhouse://localhost:8123/default
 jdbc:sqlite:database.sqlite
 ```
 
-The sidecar currently starts once per connection test or statement. Persistent
-process management, cancellation, query selection, and metadata browsing are
-the next runtime slices.
+The sidecar currently starts once per connection test or statement. Statements
+selected together therefore execute in order but do not yet share a JDBC
+session or transaction. Persistent process management, cancellation, metadata
+browsing, and stored-routine delimiter handling are the next runtime slices.
 
 ## Decisions
 

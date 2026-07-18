@@ -427,7 +427,11 @@ pub mod database_panel {
             /// Toggles the database panel.
             Toggle,
             /// Toggles focus on the database panel.
-            ToggleFocus
+            ToggleFocus,
+            /// Toggles the database query results panel.
+            ToggleResults,
+            /// Toggles focus on the database query results panel.
+            ToggleResultsFocus
         ]
     );
 }
