@@ -13,10 +13,10 @@ pub use driver_manager::{
     JdbcDriverDownload, download_jdbc_driver, installed_jdbc_driver_path, resolve_jdbc_driver_path,
 };
 pub use sidecar::{
-    ConnectionTestResult, MetadataColumn, MetadataDatabase, MetadataIndex, MetadataTable,
-    QueryColumn, QueryResult, TableChanges, TableInsert, TableMetadataDetails, TableMutationCell,
-    TableMutationResult, TableRowDelete, TableRowUpdate, apply_table_changes, browse_table,
-    describe_table, execute_query, list_databases, list_tables, test_connection,
+    ConnectionTestResult, MetadataColumn, MetadataDatabase, MetadataForeignKey, MetadataIndex,
+    MetadataTable, QueryColumn, QueryResult, TableChanges, TableInsert, TableMetadataDetails,
+    TableMutationCell, TableMutationResult, TableRowDelete, TableRowUpdate, apply_table_changes,
+    browse_table, describe_table, execute_query, list_databases, list_tables, test_connection,
 };
 pub use sql::{split_sql_statements, sql_statement_at_offset};
 

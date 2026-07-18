@@ -8,7 +8,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -36,6 +36,7 @@ pub struct QueryResult {
     pub affected_rows: Option<u64>,
     pub truncated: bool,
     pub values_truncated: bool,
+    pub has_more_rows: bool,
     pub elapsed_millis: u64,
 }
 
@@ -79,10 +80,22 @@ pub struct MetadataIndex {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MetadataForeignKey {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub referenced_catalog: Option<String>,
+    pub referenced_schema: Option<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableMetadataDetails {
     pub columns: Vec<MetadataColumn>,
     pub indexes: Vec<MetadataIndex>,
     pub primary_key: Vec<String>,
+    pub foreign_keys: Vec<MetadataForeignKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -139,6 +152,8 @@ struct RequestEnvelope<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_rows: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     catalog: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     schema: Option<&'a str>,
@@ -148,6 +163,8 @@ struct RequestEnvelope<'a> {
     where_clause: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     order_by: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filters: Option<&'a [TableMutationCell]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     changes: Option<&'a TableChanges>,
 }
@@ -194,11 +211,13 @@ pub async fn test_connection(
             connection: connection_request(profile, password),
             sql: None,
             max_rows: None,
+            offset: None,
             catalog: None,
             schema: None,
             table: None,
             where_clause: None,
             order_by: None,
+            filters: None,
             changes: None,
         },
     )
@@ -228,11 +247,13 @@ pub async fn execute_query(
             connection: connection_request(profile, password),
             sql: Some(sql),
             max_rows: Some(max_rows),
+            offset: None,
             catalog: None,
             schema: None,
             table: None,
             where_clause: None,
             order_by: None,
+            filters: None,
             changes: None,
         },
     )
@@ -252,11 +273,13 @@ pub async fn list_databases(
             connection: connection_request(profile, password),
             sql: None,
             max_rows: None,
+            offset: None,
             catalog: None,
             schema: None,
             table: None,
             where_clause: None,
             order_by: None,
+            filters: None,
             changes: None,
         },
     )
@@ -277,11 +300,13 @@ pub async fn list_tables(
             connection: connection_request(profile, password),
             sql: None,
             max_rows: None,
+            offset: None,
             catalog: database.catalog.as_deref(),
             schema: database.schema.as_deref(),
             table: None,
             where_clause: None,
             order_by: None,
+            filters: None,
             changes: None,
         },
     )
@@ -302,11 +327,13 @@ pub async fn describe_table(
             connection: connection_request(profile, password),
             sql: None,
             max_rows: None,
+            offset: None,
             catalog: table.catalog.as_deref(),
             schema: table.schema.as_deref(),
             table: Some(&table.name),
             where_clause: None,
             order_by: None,
+            filters: None,
             changes: None,
         },
     )
@@ -319,6 +346,8 @@ pub async fn browse_table(
     table: &MetadataTable,
     where_clause: Option<&str>,
     order_by: Option<&str>,
+    filters: &[TableMutationCell],
+    offset: u32,
     max_rows: u32,
 ) -> Result<QueryResult> {
     if max_rows == 0 {
@@ -333,11 +362,13 @@ pub async fn browse_table(
             connection: connection_request(profile, password),
             sql: None,
             max_rows: Some(max_rows),
+            offset: Some(offset),
             catalog: table.catalog.as_deref(),
             schema: table.schema.as_deref(),
             table: Some(&table.name),
             where_clause: where_clause.filter(|clause| !clause.trim().is_empty()),
             order_by: order_by.filter(|order| !order.trim().is_empty()),
+            filters: (!filters.is_empty()).then_some(filters),
             changes: None,
         },
     )
@@ -362,11 +393,13 @@ pub async fn apply_table_changes(
             connection: connection_request(profile, password),
             sql: None,
             max_rows: None,
+            offset: None,
             catalog: table.catalog.as_deref(),
             schema: table.schema.as_deref(),
             table: Some(&table.name),
             where_clause: None,
             order_by: None,
+            filters: None,
             changes: Some(changes),
         },
     )
@@ -535,11 +568,13 @@ mod tests {
             },
             sql: None,
             max_rows: None,
+            offset: None,
             catalog: None,
             schema: None,
             table: None,
             where_clause: None,
             order_by: None,
+            filters: None,
             changes: None,
         };
 
@@ -620,7 +655,14 @@ mod tests {
         smol::block_on(execute_query(
             &profile,
             None,
-            "create table widgets(id integer primary key, name text not null, score integer)",
+            "create table categories(id integer primary key, name text not null)",
+            100,
+        ))
+        .unwrap();
+        smol::block_on(execute_query(
+            &profile,
+            None,
+            "create table widgets(id integer primary key, name text not null, score integer, category_id integer references categories(id))",
             100,
         ))
         .unwrap();
@@ -634,7 +676,14 @@ mod tests {
         smol::block_on(execute_query(
             &profile,
             None,
-            "insert into widgets(name, score) values ('alpha', 2), ('beta', 1)",
+            "insert into categories(name) values ('primary'), ('O''Reilly')",
+            100,
+        ))
+        .unwrap();
+        smol::block_on(execute_query(
+            &profile,
+            None,
+            "insert into widgets(name, score, category_id) values ('alpha', 2, 1), ('beta', 1, 1)",
             100,
         ))
         .unwrap();
@@ -643,6 +692,26 @@ mod tests {
         assert_eq!(databases.len(), 1);
         let tables = smol::block_on(list_tables(&profile, None, &databases[0])).unwrap();
         let widgets = tables.iter().find(|table| table.name == "widgets").unwrap();
+        let categories = tables
+            .iter()
+            .find(|table| table.name == "categories")
+            .unwrap();
+        let related = smol::block_on(browse_table(
+            &profile,
+            None,
+            categories,
+            None,
+            None,
+            &[TableMutationCell {
+                column: "name".into(),
+                value: Some("O'Reilly".into()),
+            }],
+            0,
+            100,
+        ))
+        .unwrap();
+        assert_eq!(related.rows.len(), 1);
+        assert_eq!(related.rows[0][1], Some("O'Reilly".into()));
         let details = smol::block_on(describe_table(&profile, None, widgets)).unwrap();
         assert_eq!(
             details
@@ -650,9 +719,13 @@ mod tests {
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["id", "name", "score"]
+            vec!["id", "name", "score", "category_id"]
         );
         assert_eq!(details.primary_key, vec!["id"]);
+        assert_eq!(details.foreign_keys.len(), 1);
+        assert_eq!(details.foreign_keys[0].columns, vec!["category_id"]);
+        assert_eq!(details.foreign_keys[0].referenced_table, "categories");
+        assert_eq!(details.foreign_keys[0].referenced_columns, vec!["id"]);
         assert!(
             details
                 .indexes
@@ -666,11 +739,40 @@ mod tests {
             widgets,
             Some("score >= 1"),
             Some("score asc"),
+            &[],
+            0,
             100,
         ))
         .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][1], Some("beta".into()));
+
+        let first_page = smol::block_on(browse_table(
+            &profile,
+            None,
+            widgets,
+            None,
+            Some("name asc"),
+            &[],
+            0,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(first_page.rows[0][1], Some("alpha".into()));
+        assert!(first_page.has_more_rows);
+        let second_page = smol::block_on(browse_table(
+            &profile,
+            None,
+            widgets,
+            None,
+            Some("name asc"),
+            &[],
+            1,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(second_page.rows[0][1], Some("beta".into()));
+        assert!(!second_page.has_more_rows);
 
         let beta_id = result.rows[0][0].clone().unwrap();
         let alpha_id = result.rows[1][0].clone().unwrap();
@@ -720,6 +822,8 @@ mod tests {
             widgets,
             None,
             Some("name asc"),
+            &[],
+            0,
             100,
         ))
         .unwrap();

@@ -488,6 +488,7 @@ impl DatabasePanel {
             log::error!("database panel workspace was dropped");
             return;
         };
+        let workspace_handle = self.workspace.clone();
         workspace.update(cx, |workspace, cx| {
             let existing = workspace.panes().iter().find_map(|pane| {
                 pane.read(cx)
@@ -500,7 +501,8 @@ impl DatabasePanel {
                 return;
             }
 
-            let view = cx.new(|cx| TableDataView::new(profile, table, window, cx));
+            let view =
+                cx.new(|cx| TableDataView::new(profile, table, workspace_handle, window, cx));
             view.update(cx, |view, cx| view.refresh(cx));
             workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
         });
@@ -680,7 +682,7 @@ impl DatabasePanel {
                         "metadata-details-loading-{connection_id}-{database_index}-{table_index}"
                     ),
                     4,
-                    "Loading columns and indexes…",
+                    "Loading columns, indexes, and foreign keys…",
                     Color::Muted,
                 )]
             }
@@ -692,6 +694,7 @@ impl DatabasePanel {
             )],
             MetadataLoadState::Loaded(details) => {
                 let primary_key = details.primary_key;
+                let foreign_keys = details.foreign_keys;
                 let mut nodes = vec![self.render_metadata_message(
                     format!("metadata-columns-{connection_id}-{database_index}-{table_index}"),
                     4,
@@ -805,6 +808,56 @@ impl DatabasePanel {
                             }),
                     );
                 }
+                nodes.push(self.render_metadata_message(
+                    format!("metadata-foreign-keys-{connection_id}-{database_index}-{table_index}"),
+                    4,
+                    format!("Foreign Keys ({})", foreign_keys.len()),
+                    Color::Muted,
+                ));
+                if foreign_keys.is_empty() {
+                    nodes.push(self.render_metadata_message(
+                        format!(
+                            "metadata-no-foreign-keys-{connection_id}-{database_index}-{table_index}"
+                        ),
+                        5,
+                        "No foreign keys",
+                        Color::Muted,
+                    ));
+                } else {
+                    nodes.extend(foreign_keys.into_iter().enumerate().map(|(index, item)| {
+                        let label = item.name.unwrap_or_else(|| item.columns.join(", "));
+                        ListItem::new(format!(
+                            "metadata-foreign-key-{connection_id}-{database_index}-{table_index}-{index}"
+                        ))
+                        .inset(true)
+                        .indent_level(5)
+                        .disabled(true)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::ArrowRight)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(label).truncate())
+                                .child(
+                                    Label::new(format!(
+                                        "{} → {}.{}",
+                                        item.columns.join(", "),
+                                        item.referenced_table,
+                                        item.referenced_columns.join(", ")
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                                ),
+                        )
+                        .into_any_element()
+                    }));
+                }
                 nodes
             }
         }
@@ -887,7 +940,9 @@ impl DatabasePanel {
                                         },
                                     )
                                     .icon_size(IconSize::XSmall)
-                                    .tooltip(Tooltip::text("Show columns and indexes"))
+                                    .tooltip(Tooltip::text(
+                                        "Show columns, indexes, and foreign keys",
+                                    ))
                                     .on_click(cx.listener(move |panel, _, _, cx| {
                                         cx.stop_propagation();
                                         panel.toggle_metadata_table(

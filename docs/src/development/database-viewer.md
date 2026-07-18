@@ -38,9 +38,13 @@ in a native Zed view with staged row editing.
 - [x] Display bounded rows, affected-row counts, durations, truncation, and errors.
 - [x] Lazily list databases, tables, views, columns, and indexes through JDBC metadata.
 - [x] Open a table data tab with optional `WHERE` and `ORDER BY` fragments.
+- [x] Submit `WHERE` and `ORDER BY` with Enter and refresh explicitly.
 - [x] Cycle ascending, descending, and unsorted order by selecting a result column.
 - [x] Display row and column borders so editable cells are clearly delimited.
 - [x] Edit cells inline, add rows, and stage row deletions for tables with a primary key.
+- [x] Select rows and expose NULL, delete, and foreign-key navigation context actions.
+- [x] Page through table data in bounded 100-row JDBC result windows.
+- [x] Confirm before discarding staged changes during result navigation.
 - [x] Save all staged table changes in one transaction using prepared statements.
 - [x] Keep connections and tables without a JDBC-reported primary key read-only.
 - [x] Exercise the complete protocol against a temporary SQLite database.
@@ -71,10 +75,10 @@ of Cargo's dependency graph. The sidecar itself contains no database-specific
 driver: Zed adds the selected JAR to the Java classpath and `DriverManager`
 discovers it from the JDBC URL.
 
-Protocol version 3 uses length-prefixed JSON envelopes. Each request has an ID
+Protocol version 4 uses length-prefixed JSON envelopes. Each request has an ID
 and an explicit protocol version. Standard output is reserved for protocol
 frames; diagnostics go to standard error. An incompatible version is rejected
-with an actionable error. The initial query operation returns at most 200 rows,
+with an actionable error. Table browsing returns pages of at most 100 rows,
 truncates oversized cell/result text, and caps protocol frames at 16 MiB.
 Deadlines beyond JDBC's optional timeout, cancellation, result streaming, and a
 persistent sidecar process are still planned.
@@ -84,6 +88,9 @@ The sidecar independently verifies that the connection is writable, discovers
 the table and primary key through JDBC metadata, validates every identifier,
 and executes parameterized `INSERT`, `UPDATE`, and `DELETE` statements in one
 transaction. A failed statement rolls the complete change set back.
+Foreign-key navigation uses structured, metadata-validated predicates and JDBC
+prepared statements. The readable `WHERE` shown in the new tab is not used as
+raw SQL until the user edits it explicitly.
 
 ### Crate boundaries
 
@@ -139,7 +146,7 @@ driver reuse without pretending every database exposes identical metadata.
 
 ## Object explorer
 
-The explorer loads databases, tables, columns, and indexes lazily and caches
+The explorer loads databases, tables, columns, indexes, and foreign keys lazily and caches
 metadata for the current connection. Discovery stays generic: the sidecar uses
 `DatabaseMetaData` instead of branching on the selected driver. Schemas are
 currently flattened into qualified table labels below each database.
@@ -149,7 +156,8 @@ The target object model includes:
 - catalogs and schemas;
 - tables, views, and materialized views;
 - columns and data types;
-- primary keys, foreign keys, indexes, and constraints;
+- [x] primary keys, foreign keys, and indexes;
+- constraints beyond primary and foreign keys;
 - sequences, functions, procedures, and triggers where supported.
 
 Refresh invalidates only the selected subtree. Loading one schema must not scan
@@ -181,9 +189,9 @@ sidecar restart does not require restarting Zed.
 
 ### Milestone 2: object explorer
 
-- [x] Lazy databases, tables, views, columns, and indexes.
+- [x] Lazy databases, tables, views, columns, indexes, primary keys, and foreign keys.
 - [x] Refresh at database-root level.
-- Add explicit schema nodes, keys, constraints, functions, and procedures.
+- Add explicit schema nodes, remaining constraints, functions, and procedures.
 - Add refresh at every subtree level.
 - Search and filtering.
 - Copy qualified name and generate basic SQL actions.
@@ -297,21 +305,33 @@ For metadata and table data:
 3. Select the chevron beside a table and confirm that **Columns** and **Indexes**
    appear below it, including types, nullability, indexed columns, and uniqueness.
 4. Select the table row itself and confirm that a central data tab opens with at
-   most 200 rows.
-5. Enter an expression such as `score >= 10` in **WHERE**, then select **Apply**.
-6. Enter `created_at desc` in **ORDER BY**, then select **Apply**.
+   most 100 rows per page.
+5. Enter an expression such as `score >= 10` in **WHERE**, then press Enter.
+6. Enter `created_at desc` in **ORDER BY**, then press Enter.
 7. Select a column header three times. Confirm that **ORDER BY** changes to
    ascending, then descending, then empty, and that data reloads after each click.
 8. Edit the connection and disable **Read-only**, then open a table with a primary
    key. Confirm that **Add Row**, **Discard**, and **Save Changes** are available.
-9. Double-click a cell, edit its value, then select another cell. Confirm that the
+9. Select a row and confirm that **Delete Row** becomes available. Double-click a
+   cell, edit its value, then select another cell. Confirm that the
    changed cell is highlighted but that the database has not changed yet.
-10. Add a row, enter its values, mark an existing row for deletion, and select
+10. Right-click a cell and select **Set NULL**. Confirm that `NULL` is staged while
+    typing the text `NULL` directly remains an ordinary string value.
+11. Add a row, enter its values, mark an existing row for deletion using either
+    **Delete Row** or the context menu, and select
     **Save Changes**. Confirm that all three changes appear after the automatic
-    refresh. Enter the exact value `NULL` to write an SQL null.
-11. Stage another edit and select **Discard**. Confirm that original values return
+    refresh.
+12. Stage another edit and select **Refresh**, change page, select a column header,
+    or choose **View Relation**. Confirm that Zed asks whether to discard the
+    pending changes before navigating.
+13. Close a table tab with a staged edit. Confirm that Zed offers to save,
+    discard, or cancel instead of silently losing the change.
+14. Select **Discard** directly. Confirm that original values return
     and newly staged rows disappear.
-12. Open a table without a primary key. Confirm that it remains browsable but the
+15. Use **Previous** and **Next** to navigate multiple 100-row pages.
+16. Right-click a non-null foreign-key cell and select **View Relation**. Confirm
+    that a new table tab opens with the referenced row and a readable `WHERE`.
+17. Open a table without a primary key. Confirm that it remains browsable but the
     editing actions are unavailable and the toolbar explains why.
 
 The first editing slice sends at most 1,000 row mutations per save and relies on

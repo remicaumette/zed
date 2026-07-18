@@ -25,6 +25,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
@@ -32,7 +33,7 @@ import java.util.TreeSet;
 import java.util.regex.Pattern;
 
 public final class Main {
-    private static final int PROTOCOL_VERSION = 3;
+    private static final int PROTOCOL_VERSION = 4;
     private static final int MAX_FRAME_SIZE = 16 * 1024 * 1024;
     private static final int MAX_CELL_CHARACTERS = 4096;
     private static final int MAX_RESULT_CHARACTERS = 500_000;
@@ -157,7 +158,8 @@ public final class Main {
                 request.sql,
                 request.maxRows,
                 request.connection.timeoutSeconds,
-                startedAt
+                startedAt,
+                0
             );
         }
     }
@@ -169,24 +171,69 @@ public final class Main {
         if (request.maxRows <= 0) {
             throw new IllegalArgumentException("maxRows must be greater than zero");
         }
+        if (request.offset < 0) {
+            throw new IllegalArgumentException("offset cannot be negative");
+        }
 
         DriverManager.setLoginTimeout(Math.max(1, request.connection.timeoutSeconds));
         Instant startedAt = Instant.now();
         try (Connection connection = openConnection(request.connection)) {
+            DatabaseMetaData metadata = connection.getMetaData();
+            Map<String, MetadataColumn> columns = Map.of();
+            List<TableMutationCell> filters = List.of();
+            if (!valuesOrEmpty(request.filters).isEmpty()) {
+                columns = tableColumns(metadata, request);
+                filters = validateCells(request.filters, columns);
+            }
             StringBuilder sql = new StringBuilder("SELECT * FROM ")
                 .append(qualifiedTableName(connection, request));
+            boolean hasWhereClause = false;
             if (request.whereClause != null && !request.whereClause.isBlank()) {
                 sql.append(" WHERE ").append(request.whereClause.trim());
+                hasWhereClause = true;
+            }
+            if (!filters.isEmpty()) {
+                sql.append(hasWhereClause ? " AND " : " WHERE ")
+                    .append(predicates(metadata, filters));
             }
             if (request.orderBy != null && !request.orderBy.isBlank()) {
                 sql.append(" ORDER BY ").append(request.orderBy.trim());
+            }
+            if (!filters.isEmpty()) {
+                try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+                    try {
+                        statement.setQueryTimeout(
+                            Math.max(1, request.connection.timeoutSeconds)
+                        );
+                    } catch (SQLException | UnsupportedOperationException ignored) {
+                        // Query timeouts are optional in JDBC drivers.
+                    }
+                    try {
+                        long requestedRows = (long) request.offset + request.maxRows + 1;
+                        statement.setMaxRows(
+                            (int) Math.min(Integer.MAX_VALUE, requestedRows)
+                        );
+                    } catch (SQLException | UnsupportedOperationException ignored) {
+                        // The result reader still enforces the row limit.
+                    }
+                    bindCells(statement, 1, filters, columns, true);
+                    try (ResultSet resultSet = statement.executeQuery()) {
+                        return readResultSet(
+                            resultSet,
+                            request.maxRows,
+                            request.offset,
+                            startedAt
+                        );
+                    }
+                }
             }
             return execute(
                 connection,
                 sql.toString(),
                 request.maxRows,
                 request.connection.timeoutSeconds,
-                startedAt
+                startedAt,
+                request.offset
             );
         }
     }
@@ -196,7 +243,8 @@ public final class Main {
         String sql,
         int maxRows,
         int timeoutSeconds,
-        Instant startedAt
+        Instant startedAt,
+        int offset
     ) throws SQLException {
         try (Statement statement = connection.createStatement()) {
             try {
@@ -205,7 +253,8 @@ public final class Main {
                 // Query timeouts are optional in JDBC drivers.
             }
             try {
-                statement.setMaxRows(maxRows == Integer.MAX_VALUE ? maxRows : maxRows + 1);
+                long requestedRows = (long) offset + maxRows + 1;
+                statement.setMaxRows((int) Math.min(Integer.MAX_VALUE, requestedRows));
             } catch (SQLException | UnsupportedOperationException ignored) {
                 // The result reader still enforces the row limit.
             }
@@ -219,68 +268,86 @@ public final class Main {
                     updateCount >= 0 ? Long.valueOf(updateCount) : null,
                     false,
                     false,
+                    false,
                     Duration.between(startedAt, Instant.now()).toMillis()
                 );
             }
 
             try (ResultSet resultSet = statement.getResultSet()) {
-                ResultSetMetaData metadata = resultSet.getMetaData();
-                int columnCount = metadata.getColumnCount();
-                List<QueryColumn> columns = new ArrayList<>(columnCount);
-                for (int column = 1; column <= columnCount; column++) {
-                    String label = metadata.getColumnLabel(column);
-                    if (label == null || label.isBlank()) {
-                        label = metadata.getColumnName(column);
-                    }
-                    columns.add(new QueryColumn(label, metadata.getColumnTypeName(column)));
-                }
-
-                List<List<String>> rows = new ArrayList<>();
-                boolean truncated = false;
-                boolean valuesTruncated = false;
-                int remainingCharacters = MAX_RESULT_CHARACTERS;
-                rowsLoop:
-                while (resultSet.next()) {
-                    if (rows.size() >= maxRows) {
-                        truncated = true;
-                        break;
-                    }
-
-                    List<String> row = new ArrayList<>(columnCount);
-                    for (int column = 1; column <= columnCount; column++) {
-                        String value = resultSet.getString(column);
-                        if (value != null && value.length() > MAX_CELL_CHARACTERS) {
-                            value = value.substring(0, MAX_CELL_CHARACTERS);
-                            truncated = true;
-                            valuesTruncated = true;
-                        }
-                        if (value != null && value.length() > remainingCharacters) {
-                            value = value.substring(0, remainingCharacters);
-                            truncated = true;
-                            valuesTruncated = true;
-                        }
-                        row.add(value);
-                        if (value != null) {
-                            remainingCharacters -= value.length();
-                        }
-                    }
-                    rows.add(row);
-                    if (remainingCharacters == 0) {
-                        truncated = true;
-                        break rowsLoop;
-                    }
-                }
-
-                return new QueryResult(
-                    columns,
-                    rows,
-                    null,
-                    truncated,
-                    valuesTruncated,
-                    Duration.between(startedAt, Instant.now()).toMillis()
-                );
+                return readResultSet(resultSet, maxRows, offset, startedAt);
             }
         }
+    }
+
+    private static QueryResult readResultSet(
+        ResultSet resultSet,
+        int maxRows,
+        int offset,
+        Instant startedAt
+    ) throws SQLException {
+        ResultSetMetaData metadata = resultSet.getMetaData();
+        int columnCount = metadata.getColumnCount();
+        List<QueryColumn> columns = new ArrayList<>(columnCount);
+        for (int column = 1; column <= columnCount; column++) {
+            String label = metadata.getColumnLabel(column);
+            if (label == null || label.isBlank()) {
+                label = metadata.getColumnName(column);
+            }
+            columns.add(new QueryColumn(label, metadata.getColumnTypeName(column)));
+        }
+
+        List<List<String>> rows = new ArrayList<>();
+        boolean truncated = false;
+        boolean valuesTruncated = false;
+        boolean hasMoreRows = false;
+        int remainingCharacters = MAX_RESULT_CHARACTERS;
+        int rowsToSkip = offset;
+        rowsLoop:
+        while (resultSet.next()) {
+            if (rowsToSkip > 0) {
+                rowsToSkip--;
+                continue;
+            }
+            if (rows.size() >= maxRows) {
+                truncated = true;
+                hasMoreRows = true;
+                break;
+            }
+
+            List<String> row = new ArrayList<>(columnCount);
+            for (int column = 1; column <= columnCount; column++) {
+                String value = resultSet.getString(column);
+                if (value != null && value.length() > MAX_CELL_CHARACTERS) {
+                    value = value.substring(0, MAX_CELL_CHARACTERS);
+                    truncated = true;
+                    valuesTruncated = true;
+                }
+                if (value != null && value.length() > remainingCharacters) {
+                    value = value.substring(0, remainingCharacters);
+                    truncated = true;
+                    valuesTruncated = true;
+                }
+                row.add(value);
+                if (value != null) {
+                    remainingCharacters -= value.length();
+                }
+            }
+            rows.add(row);
+            if (remainingCharacters == 0) {
+                truncated = true;
+                break rowsLoop;
+            }
+        }
+
+        return new QueryResult(
+            columns,
+            rows,
+            null,
+            truncated,
+            valuesTruncated,
+            hasMoreRows,
+            Duration.between(startedAt, Instant.now()).toMillis()
+        );
     }
 
     private static List<MetadataDatabase> listDatabases(ConnectionRequest request)
@@ -448,7 +515,12 @@ public final class Main {
                 ));
             }
             indexes.sort(Comparator.comparing(index -> index.name, String.CASE_INSENSITIVE_ORDER));
-            return new TableMetadataDetails(columns, indexes, primaryKey(metadata, request));
+            return new TableMetadataDetails(
+                columns,
+                indexes,
+                primaryKey(metadata, request),
+                foreignKeys(metadata, request)
+            );
         }
     }
 
@@ -472,6 +544,61 @@ public final class Main {
             // Missing primary-key metadata makes the table read-only.
         }
         return new ArrayList<>(columns.values());
+    }
+
+    private static List<MetadataForeignKey> foreignKeys(
+        DatabaseMetaData metadata,
+        RequestEnvelope request
+    ) {
+        List<MetadataForeignKey> foreignKeys = new ArrayList<>();
+        ForeignKeyAccumulator current = null;
+        try {
+            try (ResultSet result = metadata.getImportedKeys(
+                request.catalog,
+                request.schema,
+                request.table
+            )) {
+                while (result.next()) {
+                    String column = nullableString(result, "FKCOLUMN_NAME");
+                    String referencedTable = nullableString(result, "PKTABLE_NAME");
+                    String referencedColumn = nullableString(result, "PKCOLUMN_NAME");
+                    if (isBlank(column) || isBlank(referencedTable) || isBlank(referencedColumn)) {
+                        continue;
+                    }
+
+                    String name = nullableString(result, "FK_NAME");
+                    String referencedCatalog = nullableString(result, "PKTABLE_CAT");
+                    String referencedSchema = nullableString(result, "PKTABLE_SCHEM");
+                    int sequence = result.getShort("KEY_SEQ");
+                    if (current == null
+                        || sequence <= 1
+                        || !current.matches(
+                            name,
+                            referencedCatalog,
+                            referencedSchema,
+                            referencedTable
+                        )) {
+                        if (current != null) {
+                            foreignKeys.add(current.build());
+                        }
+                        current = new ForeignKeyAccumulator(
+                            name,
+                            referencedCatalog,
+                            referencedSchema,
+                            referencedTable
+                        );
+                    }
+                    current.columns.put(sequence, column);
+                    current.referencedColumns.put(sequence, referencedColumn);
+                }
+            }
+        } catch (SQLException | UnsupportedOperationException ignored) {
+            // Foreign-key metadata is optional for custom and analytical JDBC drivers.
+        }
+        if (current != null) {
+            foreignKeys.add(current.build());
+        }
+        return foreignKeys;
     }
 
     private static TableMutationResult applyTableChanges(RequestEnvelope request)
@@ -820,11 +947,13 @@ public final class Main {
         public ConnectionRequest connection;
         public String sql;
         public int maxRows;
+        public int offset;
         public String catalog;
         public String schema;
         public String table;
         public String whereClause;
         public String orderBy;
+        public List<TableMutationCell> filters;
         public TableChanges changes;
     }
 
@@ -903,6 +1032,7 @@ public final class Main {
         public final Long affectedRows;
         public final boolean truncated;
         public final boolean valuesTruncated;
+        public final boolean hasMoreRows;
         public final long elapsedMillis;
 
         QueryResult(
@@ -911,6 +1041,7 @@ public final class Main {
             Long affectedRows,
             boolean truncated,
             boolean valuesTruncated,
+            boolean hasMoreRows,
             long elapsedMillis
         ) {
             this.columns = columns;
@@ -918,6 +1049,7 @@ public final class Main {
             this.affectedRows = affectedRows;
             this.truncated = truncated;
             this.valuesTruncated = valuesTruncated;
+            this.hasMoreRows = hasMoreRows;
             this.elapsedMillis = elapsedMillis;
         }
     }
@@ -1000,15 +1132,43 @@ public final class Main {
         public final List<MetadataColumn> columns;
         public final List<MetadataIndex> indexes;
         public final List<String> primaryKey;
+        public final List<MetadataForeignKey> foreignKeys;
 
         TableMetadataDetails(
             List<MetadataColumn> columns,
             List<MetadataIndex> indexes,
-            List<String> primaryKey
+            List<String> primaryKey,
+            List<MetadataForeignKey> foreignKeys
         ) {
             this.columns = columns;
             this.indexes = indexes;
             this.primaryKey = primaryKey;
+            this.foreignKeys = foreignKeys;
+        }
+    }
+
+    public static final class MetadataForeignKey {
+        public final String name;
+        public final List<String> columns;
+        public final String referencedCatalog;
+        public final String referencedSchema;
+        public final String referencedTable;
+        public final List<String> referencedColumns;
+
+        MetadataForeignKey(
+            String name,
+            List<String> columns,
+            String referencedCatalog,
+            String referencedSchema,
+            String referencedTable,
+            List<String> referencedColumns
+        ) {
+            this.name = name;
+            this.columns = columns;
+            this.referencedCatalog = referencedCatalog;
+            this.referencedSchema = referencedSchema;
+            this.referencedTable = referencedTable;
+            this.referencedColumns = referencedColumns;
         }
     }
 
@@ -1063,6 +1223,50 @@ public final class Main {
         IndexAccumulator(String name, boolean unique) {
             this.name = name;
             this.unique = unique;
+        }
+    }
+
+    private static final class ForeignKeyAccumulator {
+        final String name;
+        final String referencedCatalog;
+        final String referencedSchema;
+        final String referencedTable;
+        final Map<Integer, String> columns = new TreeMap<>();
+        final Map<Integer, String> referencedColumns = new TreeMap<>();
+
+        ForeignKeyAccumulator(
+            String name,
+            String referencedCatalog,
+            String referencedSchema,
+            String referencedTable
+        ) {
+            this.name = name;
+            this.referencedCatalog = referencedCatalog;
+            this.referencedSchema = referencedSchema;
+            this.referencedTable = referencedTable;
+        }
+
+        boolean matches(
+            String name,
+            String referencedCatalog,
+            String referencedSchema,
+            String referencedTable
+        ) {
+            return Objects.equals(this.name, name)
+                && Objects.equals(this.referencedCatalog, referencedCatalog)
+                && Objects.equals(this.referencedSchema, referencedSchema)
+                && Objects.equals(this.referencedTable, referencedTable);
+        }
+
+        MetadataForeignKey build() {
+            return new MetadataForeignKey(
+                name,
+                new ArrayList<>(columns.values()),
+                referencedCatalog,
+                referencedSchema,
+                referencedTable,
+                new ArrayList<>(referencedColumns.values())
+            );
         }
     }
 

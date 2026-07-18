@@ -1,23 +1,27 @@
-use std::collections::HashSet;
+use std::{cell::Cell, collections::HashSet, rc::Rc};
 
 use anyhow::{Context as _, Result, anyhow};
 use database::{
-    ConnectionId, ConnectionProfile, MetadataColumn, MetadataTable, QueryColumn, QueryResult,
-    TableChanges, TableInsert, TableMetadataDetails, TableMutationCell, TableRowDelete,
-    TableRowUpdate, apply_table_changes, browse_table, describe_table,
+    ConnectionId, ConnectionProfile, MetadataColumn, MetadataForeignKey, MetadataTable,
+    QueryColumn, QueryResult, TableChanges, TableInsert, TableMetadataDetails, TableMutationCell,
+    TableRowDelete, TableRowUpdate, apply_table_changes, browse_table, describe_table,
 };
 use gpui::{
-    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
-    Subscription, Task, Window, px,
+    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
+    PromptLevel, Render, Subscription, Task, WeakEntity, Window, px,
 };
+use project::Project;
 use ui::{
-    Banner, Button, ButtonStyle, Color, Icon, IconName, Label, LabelSize, Severity, Table, Tooltip,
-    prelude::*,
+    Banner, Button, ButtonStyle, Color, ContextMenu, Icon, IconName, Label, LabelSize, Severity,
+    Table, prelude::*, right_click_menu,
 };
-use ui_input::InputField;
-use workspace::{Item, Workspace};
+use ui_input::{ErasedEditorEvent, InputField};
+use workspace::{
+    Item, Workspace,
+    item::{ItemBufferKind, SaveOptions},
+};
 
-const TABLE_DATA_MAX_ROWS: u32 = 200;
+const TABLE_DATA_PAGE_SIZE: u32 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SortDirection {
@@ -46,8 +50,8 @@ struct LoadedTableData {
     columns: Vec<QueryColumn>,
     rows: Vec<EditableRow>,
     details: TableMetadataDetails,
-    truncated: bool,
     values_truncated: bool,
+    has_more_rows: bool,
     elapsed_millis: u64,
 }
 
@@ -66,8 +70,8 @@ impl LoadedTableData {
                 })
                 .collect(),
             details,
-            truncated: result.truncated,
             values_truncated: result.values_truncated,
+            has_more_rows: result.has_more_rows,
             elapsed_millis: result.elapsed_millis,
         }
     }
@@ -107,15 +111,42 @@ struct ActiveCellEditor {
     row: usize,
     column: usize,
     input: Entity<InputField>,
+    original: Option<String>,
+    edited: Rc<Cell<bool>>,
+    _input_subscription: Subscription,
     _focus_out_subscription: Subscription,
+}
+
+#[derive(Clone)]
+struct RelationTarget {
+    table: MetadataTable,
+    where_clause: String,
+    filters: Vec<TableMutationCell>,
+}
+
+#[derive(Clone)]
+enum TableNavigation {
+    Reload {
+        page: u32,
+    },
+    Sort {
+        sort: Option<(String, SortDirection)>,
+        expression: String,
+    },
+    Relation(RelationTarget),
 }
 
 pub(crate) struct TableDataView {
     profile: ConnectionProfile,
     table: MetadataTable,
+    workspace: WeakEntity<Workspace>,
     where_clause: Entity<InputField>,
     order_by: Entity<InputField>,
     sort: Option<(String, SortDirection)>,
+    relation_filters: Vec<TableMutationCell>,
+    relation_where_display: Option<String>,
+    page: u32,
+    selected_row: Option<usize>,
     state: TableDataState,
     editing_cell: Option<ActiveCellEditor>,
     is_saving: bool,
@@ -127,6 +158,7 @@ impl TableDataView {
     pub(crate) fn new(
         profile: ConnectionProfile,
         table: MetadataTable,
+        workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -143,9 +175,14 @@ impl TableDataView {
         Self {
             profile,
             table,
+            workspace,
             where_clause,
             order_by,
             sort: None,
+            relation_filters: Vec::new(),
+            relation_where_display: None,
+            page: 0,
+            selected_row: None,
             state: TableDataState::Empty,
             editing_cell: None,
             is_saving: false,
@@ -173,7 +210,9 @@ impl TableDataView {
     }
 
     fn has_pending_changes(&self) -> bool {
-        self.editing_cell.is_some()
+        self.editing_cell
+            .as_ref()
+            .is_some_and(|editor| editor.edited.get())
             || matches!(&self.state, TableDataState::Loaded(data) if data.has_changes())
     }
 
@@ -187,17 +226,80 @@ impl TableDataView {
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.commit_active_edit(cx);
-        if self.has_pending_changes() {
-            self.save_error = Some("Save or discard the pending changes before reloading".into());
-            cx.notify();
+        self.reload(cx);
+    }
+
+    fn request_navigation(
+        &mut self,
+        navigation: TableNavigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_saving {
             return;
         }
-        self.reload(cx);
+        if !matches!(&navigation, TableNavigation::Relation(_))
+            && self.relation_where_display.as_deref()
+                != Some(self.where_clause.read(cx).text(cx).as_str())
+        {
+            self.relation_filters.clear();
+            self.relation_where_display = None;
+        }
+        self.commit_active_edit(cx);
+        if !self.has_pending_changes() {
+            self.perform_navigation(navigation, window, cx);
+            return;
+        }
+
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Discard pending table changes?",
+            Some("This navigation reloads or replaces the current result set."),
+            &["Discard Changes", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await? == 0 {
+                this.update_in(cx, |this, window, cx| {
+                    this.discard_changes(cx);
+                    this.perform_navigation(navigation, window, cx);
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn perform_navigation(
+        &mut self,
+        navigation: TableNavigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match navigation {
+            TableNavigation::Reload { page } => {
+                self.page = page;
+                self.selected_row = None;
+                self.reload(cx);
+            }
+            TableNavigation::Sort { sort, expression } => {
+                self.sort = sort;
+                self.page = 0;
+                self.selected_row = None;
+                self.order_by
+                    .update(cx, |input, cx| input.set_text(&expression, window, cx));
+                self.reload(cx);
+            }
+            TableNavigation::Relation(relation) => {
+                self.open_relation(relation, window, cx);
+            }
+        }
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
         let where_clause = self.where_clause.read(cx).text(cx);
+        let relation_filters = self.relation_filters.clone();
+        let effective_where_clause = relation_filters.is_empty().then_some(where_clause);
         let order_by = self.order_by.read(cx).text(cx);
         if self
             .sort
@@ -210,9 +312,11 @@ impl TableDataView {
 
         let profile = self.profile.clone();
         let table = self.table.clone();
+        let offset = self.page.saturating_mul(TABLE_DATA_PAGE_SIZE);
         let credentials_provider = zed_credentials_provider::global(cx);
         self.state = TableDataState::Loading;
         self.editing_cell = None;
+        self.selected_row = None;
         self.is_saving = false;
         self.save_error = None;
         cx.notify();
@@ -226,9 +330,11 @@ impl TableDataView {
                     &profile,
                     password.as_deref(),
                     &table,
-                    Some(&where_clause),
+                    effective_where_clause.as_deref(),
                     Some(&order_by),
-                    TABLE_DATA_MAX_ROWS,
+                    &relation_filters,
+                    offset,
+                    TABLE_DATA_PAGE_SIZE,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>((result, details))
@@ -269,10 +375,10 @@ impl TableDataView {
             return;
         };
         let text = editor.input.read(cx).text(cx);
-        let value = if text.eq_ignore_ascii_case("NULL") {
-            None
-        } else {
+        let value = if editor.edited.get() {
             Some(text)
+        } else {
+            editor.original
         };
         if let TableDataState::Loaded(data) = &mut self.state
             && let Some(row) = data.rows.get_mut(editor.row)
@@ -306,10 +412,24 @@ impl TableDataView {
             return;
         };
         let input = cx.new(|cx| {
-            let input = InputField::new(window, cx, "NULL").label_min_width(px(80.));
-            input.set_text(value.as_deref().unwrap_or("NULL"), window, cx);
+            let input = InputField::new(window, cx, "Enter a value").label_min_width(px(80.));
+            input.set_text(value.as_deref().unwrap_or_default(), window, cx);
             input
         });
+        let edited = Rc::new(Cell::new(false));
+        let edited_for_subscription = edited.clone();
+        let view = cx.weak_entity();
+        let input_editor = input.read(cx).editor().clone();
+        let input_subscription = input_editor.subscribe(
+            Box::new(move |event, _, cx| {
+                if event == ErasedEditorEvent::BufferEdited {
+                    edited_for_subscription.set(true);
+                    view.update(cx, |_, cx| cx.notify()).ok();
+                }
+            }),
+            window,
+            cx,
+        );
         let focus_handle = input.focus_handle(cx);
         let focus_out_subscription = cx.on_focus_out(&focus_handle, window, |this, _, _, cx| {
             this.commit_active_edit(cx);
@@ -319,10 +439,30 @@ impl TableDataView {
             row,
             column,
             input,
+            original: value,
+            edited,
+            _input_subscription: input_subscription,
             _focus_out_subscription: focus_out_subscription,
         });
         window.focus(&focus_handle, cx);
         cx.notify();
+    }
+
+    fn set_cell_null(&mut self, row_index: usize, column_index: usize, cx: &mut Context<Self>) {
+        if !self.can_edit() || self.is_saving {
+            return;
+        }
+        self.commit_active_edit(cx);
+        if let TableDataState::Loaded(data) = &mut self.state
+            && let Some(row) = data.rows.get_mut(row_index)
+            && !row.deleted
+            && let Some(cell) = row.values.get_mut(column_index)
+        {
+            *cell = None;
+            row.edited_columns.insert(column_index);
+            self.selected_row = Some(row_index);
+            cx.notify();
+        }
     }
 
     fn add_row(&mut self, cx: &mut Context<Self>) {
@@ -337,6 +477,7 @@ impl TableDataView {
                 edited_columns: HashSet::default(),
                 deleted: false,
             });
+            self.selected_row = data.rows.len().checked_sub(1);
             cx.notify();
         }
     }
@@ -353,15 +494,32 @@ impl TableDataView {
                 .is_some_and(|row| row.original.is_none())
             {
                 data.rows.remove(row_index);
+                self.selected_row = self.selected_row.and_then(|selected| {
+                    if selected == row_index {
+                        None
+                    } else if selected > row_index {
+                        Some(selected - 1)
+                    } else {
+                        Some(selected)
+                    }
+                });
             } else if let Some(row) = data.rows.get_mut(row_index) {
                 row.deleted = !row.deleted;
+                self.selected_row = Some(row_index);
             }
             cx.notify();
         }
     }
 
+    fn toggle_selected_row(&mut self, cx: &mut Context<Self>) {
+        if let Some(row_index) = self.selected_row {
+            self.toggle_delete(row_index, cx);
+        }
+    }
+
     fn discard_changes(&mut self, cx: &mut Context<Self>) {
         self.editing_cell = None;
+        self.selected_row = None;
         self.save_error = None;
         if let TableDataState::Loaded(data) = &mut self.state {
             data.rows.retain(|row| row.original.is_some());
@@ -463,8 +621,17 @@ impl TableDataView {
     }
 
     fn save_changes(&mut self, cx: &mut Context<Self>) {
+        let task = self.save_changes_task(cx);
+        self.task = Some(cx.spawn(async move |_, _| {
+            if let Err(error) = task.await {
+                log::error!("failed to save database table changes: {error:#}");
+            }
+        }));
+    }
+
+    fn save_changes_task(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         if !self.can_edit() || self.is_saving {
-            return;
+            return Task::ready(Ok(()));
         }
         self.commit_active_edit(cx);
         let changes = match self.build_changes() {
@@ -472,12 +639,12 @@ impl TableDataView {
             Err(error) => {
                 self.save_error = Some(error.to_string());
                 cx.notify();
-                return;
+                return Task::ready(Err(error));
             }
         };
         if changes.updates.is_empty() && changes.inserts.is_empty() && changes.deletes.is_empty() {
             cx.notify();
-            return;
+            return Task::ready(Ok(()));
         }
 
         let profile = self.profile.clone();
@@ -486,32 +653,33 @@ impl TableDataView {
         self.is_saving = true;
         self.save_error = None;
         cx.notify();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = async {
                 let password =
                     Self::saved_password(&profile, credentials_provider.as_ref(), cx).await?;
                 apply_table_changes(&profile, password.as_deref(), &table, &changes).await
             }
             .await;
-            this.update(cx, |this, cx| match result {
-                Ok(_) => this.reload(cx),
-                Err(error) => {
-                    this.is_saving = false;
-                    this.save_error = Some(error.to_string());
-                    cx.notify();
+            match result {
+                Ok(_) => {
+                    this.update(cx, |this, cx| this.reload(cx))?;
+                    Ok(())
                 }
-            })
-            .ok();
-        }));
+                Err(error) => {
+                    let message = error.to_string();
+                    this.update(cx, |this, cx| {
+                        this.is_saving = false;
+                        this.save_error = Some(message);
+                        cx.notify();
+                    })?;
+                    Err(error)
+                }
+            }
+        })
     }
 
     fn sort_by(&mut self, column: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.has_pending_changes() || self.is_saving {
-            self.save_error = Some("Save or discard the pending changes before sorting".into());
-            cx.notify();
-            return;
-        }
-        self.sort = match &self.sort {
+        let sort = match &self.sort {
             Some((current, SortDirection::Ascending)) if current == &column => {
                 Some((column, SortDirection::Descending))
             }
@@ -519,14 +687,146 @@ impl TableDataView {
             _ => Some((column, SortDirection::Ascending)),
         };
 
-        let expression = self
-            .sort
+        let expression = sort
             .as_ref()
             .map(|(column, direction)| self.order_expression(column, *direction))
             .unwrap_or_default();
-        self.order_by
-            .update(cx, |input, cx| input.set_text(&expression, window, cx));
-        self.refresh(cx);
+        self.request_navigation(TableNavigation::Sort { sort, expression }, window, cx);
+    }
+
+    fn relation_for_cell(
+        &self,
+        data: &LoadedTableData,
+        row_index: usize,
+        column_index: usize,
+    ) -> Option<RelationTarget> {
+        if data.values_truncated {
+            return None;
+        }
+        let column = data.columns.get(column_index)?;
+        let foreign_key = data.details.foreign_keys.iter().find(|foreign_key| {
+            foreign_key
+                .columns
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&column.label))
+        })?;
+        let row = data.rows.get(row_index)?;
+        let (where_clause, filters) =
+            Self::relation_where_clause(data, row, foreign_key, &self.table)?;
+        Some(RelationTarget {
+            table: MetadataTable {
+                catalog: foreign_key.referenced_catalog.clone(),
+                schema: foreign_key.referenced_schema.clone(),
+                name: foreign_key.referenced_table.clone(),
+                table_type: "TABLE".into(),
+                identifier_quote: self.table.identifier_quote.clone(),
+            },
+            where_clause,
+            filters,
+        })
+    }
+
+    fn relation_where_clause(
+        data: &LoadedTableData,
+        row: &EditableRow,
+        foreign_key: &MetadataForeignKey,
+        source_table: &MetadataTable,
+    ) -> Option<(String, Vec<TableMutationCell>)> {
+        if foreign_key.columns.len() != foreign_key.referenced_columns.len() {
+            return None;
+        }
+        let predicates = foreign_key
+            .columns
+            .iter()
+            .zip(&foreign_key.referenced_columns)
+            .map(|(column, referenced_column)| {
+                let index = data
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate.label.eq_ignore_ascii_case(column))?;
+                let value = row.values.get(index)?.as_ref()?;
+                let value = value.replace('\'', "''");
+                Some(format!(
+                    "{} = '{value}'",
+                    Self::quote_identifier(
+                        referenced_column,
+                        source_table.identifier_quote.as_deref()
+                    )
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let filters = foreign_key
+            .columns
+            .iter()
+            .zip(&foreign_key.referenced_columns)
+            .map(|(column, referenced_column)| {
+                let index = data
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate.label.eq_ignore_ascii_case(column))?;
+                Some(TableMutationCell {
+                    column: referenced_column.clone(),
+                    value: row.values.get(index)?.clone(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((predicates.join(" AND "), filters))
+    }
+
+    fn quote_identifier(identifier: &str, quote: Option<&str>) -> String {
+        if let Some(quote) = quote {
+            format!(
+                "{quote}{}{quote}",
+                identifier.replace(quote, &format!("{quote}{quote}"))
+            )
+        } else {
+            identifier.to_owned()
+        }
+    }
+
+    fn view_relation(
+        &mut self,
+        row_index: usize,
+        column_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let relation = match &self.state {
+            TableDataState::Loaded(data) => self.relation_for_cell(data, row_index, column_index),
+            _ => None,
+        };
+        if let Some(relation) = relation {
+            self.request_navigation(TableNavigation::Relation(relation), window, cx);
+        }
+    }
+
+    fn open_relation(
+        &mut self,
+        relation: RelationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.save_error = Some("The workspace is no longer available".into());
+            cx.notify();
+            return;
+        };
+        let profile = self.profile.clone();
+        let workspace_handle = self.workspace.clone();
+        workspace.update(cx, |workspace, cx| {
+            let view = cx.new(|cx| {
+                TableDataView::new(profile, relation.table, workspace_handle, window, cx)
+            });
+            view.update(cx, |view, cx| {
+                view.where_clause.update(cx, |input, cx| {
+                    input.set_text(&relation.where_clause, window, cx)
+                });
+                view.relation_filters = relation.filters;
+                view.relation_where_display = Some(relation.where_clause);
+                view.reload(cx);
+            });
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
     }
 
     fn render_result(
@@ -544,152 +844,238 @@ impl TableDataView {
         }
 
         let can_edit = self.can_edit();
-        let mut headers = Vec::new();
-        if can_edit {
-            headers.push(
-                Label::new("Row")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .into_any_element(),
-            );
-        }
-        headers.extend(data.columns.iter().enumerate().map(|(index, column)| {
-            let column_name = column.label.clone();
-            let direction = self.sort.as_ref().and_then(|(sorted_column, direction)| {
-                (sorted_column == &column_name).then_some(*direction)
-            });
-            v_flex()
-                .min_w_0()
-                .child(
-                    Button::new(
-                        format!("table-data-sort-column-{index}"),
-                        column.label.clone(),
-                    )
-                    .style(ButtonStyle::Subtle)
-                    .when_some(direction, |button, direction| {
-                        button.end_icon(
-                            Icon::new(match direction {
-                                SortDirection::Ascending => IconName::ArrowUp,
-                                SortDirection::Descending => IconName::ArrowDown,
-                            })
-                            .size(ui::IconSize::XSmall),
+        let headers = data
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let column_name = column.label.clone();
+                let direction = self.sort.as_ref().and_then(|(sorted_column, direction)| {
+                    (sorted_column == &column_name).then_some(*direction)
+                });
+                v_flex()
+                    .min_w_0()
+                    .child(
+                        Button::new(
+                            format!("table-data-sort-column-{index}"),
+                            column.label.clone(),
                         )
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.sort_by(column_name.clone(), window, cx)
-                    })),
-                )
-                .child(
-                    Label::new(column.type_name.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
-                )
-                .into_any_element()
-        }));
-        let table_column_count = data.columns.len() + usize::from(can_edit);
+                        .style(ButtonStyle::Subtle)
+                        .when_some(direction, |button, direction| {
+                            button.end_icon(
+                                Icon::new(match direction {
+                                    SortDirection::Ascending => IconName::ArrowUp,
+                                    SortDirection::Descending => IconName::ArrowDown,
+                                })
+                                .size(ui::IconSize::XSmall),
+                            )
+                        })
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.sort_by(column_name.clone(), window, cx)
+                            },
+                        )),
+                    )
+                    .child(
+                        Label::new(column.type_name.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let table_column_count = data.columns.len();
         let mut table = Table::new(table_column_count)
             .width(px((table_column_count.max(1) * 180) as f32))
             .header(headers)
             .column_borders();
         for (row_index, row) in data.rows.iter().enumerate() {
-            let mut cells = Vec::new();
-            if can_edit {
-                let deleted = row.deleted;
-                cells.push(
-                    IconButton::new(
-                        format!("table-data-delete-row-{row_index}"),
-                        if deleted {
-                            IconName::RotateCcw
+            let cells =
+                row.values
+                    .iter()
+                    .enumerate()
+                    .map(|(column_index, value)| {
+                        if let Some(editor) = self.editing_cell.as_ref().filter(|editor| {
+                            editor.row == row_index && editor.column == column_index
+                        }) {
+                            return div()
+                                .id((
+                                    "table-data-editor",
+                                    row_index * data.columns.len() + column_index,
+                                ))
+                                .w_full()
+                                .child(editor.input.clone())
+                                .into_any_element();
+                        }
+
+                        let changed = row
+                            .original
+                            .as_ref()
+                            .is_none_or(|original| original.get(column_index) != Some(value));
+                        let uses_default = row.original.is_none()
+                            && !row.edited_columns.contains(&column_index)
+                            && value.is_none()
+                            && data
+                                .columns
+                                .get(column_index)
+                                .and_then(|column| data.metadata_column(&column.label))
+                                .is_some_and(|metadata| {
+                                    metadata.auto_increment || metadata.default_value.is_some()
+                                });
+                        let label = if uses_default {
+                            Label::new("DEFAULT")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
                         } else {
-                            IconName::Trash
-                        },
-                    )
-                    .icon_size(ui::IconSize::Small)
-                    .icon_color(if deleted { Color::Muted } else { Color::Error })
-                    .disabled(self.is_saving)
-                    .tooltip(Tooltip::text(if deleted {
-                        "Restore row"
-                    } else {
-                        "Delete row when changes are saved"
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_delete(row_index, cx)))
-                    .into_any_element(),
-                );
-            }
-            cells.extend(row.values.iter().enumerate().map(|(column_index, value)| {
-                if let Some(editor) = self
-                    .editing_cell
-                    .as_ref()
-                    .filter(|editor| editor.row == row_index && editor.column == column_index)
-                {
-                    return div()
-                        .id((
-                            "table-data-editor",
+                            match value {
+                                Some(value) => Label::new(value.clone()).size(LabelSize::Small),
+                                None => Label::new("NULL")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            }
+                        }
+                        .when(row.deleted, |label| label.strikethrough());
+                        let cell = div()
+                            .id((
+                                "table-data-cell",
+                                row_index * data.columns.len() + column_index,
+                            ))
+                            .w_full()
+                            .when(row.deleted, |this| {
+                                this.bg(cx.theme().status().deleted_background.opacity(0.35))
+                            })
+                            .when(changed && !row.deleted, |this| {
+                                this.bg(if row.original.is_none() {
+                                    cx.theme().status().created_background.opacity(0.35)
+                                } else {
+                                    cx.theme().status().warning_background.opacity(0.35)
+                                })
+                            })
+                            .when(can_edit && !row.deleted && !self.is_saving, |this| {
+                                this.cursor_text().on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        if event.click_count() >= 2 {
+                                            this.start_editing(row_index, column_index, window, cx);
+                                        }
+                                    },
+                                ))
+                            })
+                            .child(label)
+                            .into_any_element();
+
+                        let relation_available = self
+                            .relation_for_cell(data, row_index, column_index)
+                            .is_some();
+                        let can_row_action = can_edit && !self.is_saving;
+                        let nullable = data
+                            .columns
+                            .get(column_index)
+                            .and_then(|column| data.metadata_column(&column.label))
+                            .is_some_and(|column| column.nullable);
+                        let can_set_null = can_row_action && !row.deleted && nullable;
+                        let deleted = row.deleted;
+                        let this = cx.weak_entity();
+                        right_click_menu((
+                            "database-table-cell-menu",
                             row_index * data.columns.len() + column_index,
                         ))
-                        .w_full()
-                        .child(editor.input.clone())
-                        .into_any_element();
-                }
+                        .trigger(move |_, _, _| cell)
+                        .maybe_menu(move |window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.selected_row = Some(row_index);
+                                cx.notify();
+                            })
+                            .ok();
+                            if !can_row_action && !relation_available {
+                                return None;
+                            }
 
-                let changed = row
-                    .original
-                    .as_ref()
-                    .is_none_or(|original| original.get(column_index) != Some(value));
-                let uses_default = row.original.is_none()
-                    && !row.edited_columns.contains(&column_index)
-                    && value.is_none()
-                    && data
-                        .columns
-                        .get(column_index)
-                        .and_then(|column| data.metadata_column(&column.label))
-                        .is_some_and(|metadata| {
-                            metadata.auto_increment || metadata.default_value.is_some()
-                        });
-                let label = if uses_default {
-                    Label::new("DEFAULT")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                } else {
-                    match value {
-                        Some(value) => Label::new(value.clone()).size(LabelSize::Small),
-                        None => Label::new("NULL")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    }
-                }
-                .when(row.deleted, |label| label.strikethrough());
-                div()
-                    .id((
-                        "table-data-cell",
-                        row_index * data.columns.len() + column_index,
-                    ))
-                    .w_full()
-                    .when(row.deleted, |this| {
-                        this.bg(cx.theme().status().deleted_background.opacity(0.35))
-                    })
-                    .when(changed && !row.deleted, |this| {
-                        this.bg(if row.original.is_none() {
-                            cx.theme().status().created_background.opacity(0.35)
-                        } else {
-                            cx.theme().status().warning_background.opacity(0.35)
-                        })
-                    })
-                    .when(can_edit && !row.deleted && !self.is_saving, |this| {
-                        this.cursor_text().on_click(cx.listener(
-                            move |this, event: &ClickEvent, window, cx| {
-                                if event.click_count() >= 2 {
-                                    this.start_editing(row_index, column_index, window, cx);
+                            let set_null_view = this.clone();
+                            let delete_view = this.clone();
+                            let relation_view = this.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                if can_set_null {
+                                    menu = menu.entry("Set NULL", None, {
+                                        let set_null_view = set_null_view.clone();
+                                        move |_, cx| {
+                                            set_null_view
+                                                .update(cx, |this, cx| {
+                                                    this.set_cell_null(row_index, column_index, cx)
+                                                })
+                                                .ok();
+                                        }
+                                    });
                                 }
-                            },
-                        ))
+                                if can_row_action {
+                                    menu = menu.entry(
+                                        if deleted { "Restore Row" } else { "Delete Row" },
+                                        None,
+                                        {
+                                            let delete_view = delete_view.clone();
+                                            move |_, cx| {
+                                                delete_view
+                                                    .update(cx, |this, cx| {
+                                                        this.toggle_delete(row_index, cx)
+                                                    })
+                                                    .ok();
+                                            }
+                                        },
+                                    );
+                                }
+                                if relation_available {
+                                    if can_row_action {
+                                        menu = menu.separator();
+                                    }
+                                    menu = menu.entry("View Relation", None, {
+                                        let relation_view = relation_view.clone();
+                                        move |window, cx| {
+                                            relation_view
+                                                .update(cx, |this, cx| {
+                                                    this.view_relation(
+                                                        row_index,
+                                                        column_index,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                                .ok();
+                                        }
+                                    });
+                                }
+                                menu
+                            }))
+                        })
+                        .into_any_element()
                     })
-                    .child(label)
-                    .into_any_element()
-            }));
+                    .collect::<Vec<_>>();
             table = table.row(cells);
         }
+
+        let selected_row = self.selected_row;
+        let table_view = cx.weak_entity();
+        table = table.map_row(move |(row_index, row), _, cx| {
+            let table_view = table_view.clone();
+            row.when(selected_row == Some(row_index), |row| {
+                row.bg(cx.theme().colors().element_selected.opacity(0.55))
+            })
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                table_view
+                    .update(cx, |this, cx| {
+                        this.selected_row = Some(row_index);
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .into_any_element()
+        });
+
+        let offset = self.page.saturating_mul(TABLE_DATA_PAGE_SIZE) as usize;
+        let first_row = (!data.rows.is_empty()).then_some(offset + 1);
+        let last_row = offset + data.rows.len();
+        let previous_page = self.page.saturating_sub(1);
+        let next_page = self.page.saturating_add(1);
 
         v_flex()
             .size_full()
@@ -703,20 +1089,49 @@ impl TableDataView {
                     .border_color(cx.theme().colors().border)
                     .child(
                         Label::new(format!(
-                            "{} row{} in {} ms",
-                            data.rows.len(),
-                            if data.rows.len() == 1 { "" } else { "s" },
+                            "{} · Page {} · {} ms",
+                            first_row
+                                .map(|first| format!("Rows {first}–{last_row}"))
+                                .unwrap_or_else(|| "No rows".into()),
+                            self.page.saturating_add(1),
                             data.elapsed_millis
                         ))
                         .size(LabelSize::Small),
                     )
-                    .when(data.truncated, |this| {
+                    .when(data.values_truncated, |this| {
                         this.child(
-                            Label::new(format!("Limited to {TABLE_DATA_MAX_ROWS} rows"))
+                            Label::new("Some cell values were truncated")
                                 .size(LabelSize::Small)
                                 .color(Color::Warning),
                         )
-                    }),
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("database-table-previous-page", "Previous")
+                            .style(ButtonStyle::Subtle)
+                            .disabled(self.page == 0 || self.is_saving)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.request_navigation(
+                                    TableNavigation::Reload {
+                                        page: previous_page,
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .child(
+                        Button::new("database-table-next-page", "Next")
+                            .style(ButtonStyle::Subtle)
+                            .disabled(!data.has_more_rows || self.is_saving)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.request_navigation(
+                                    TableNavigation::Reload { page: next_page },
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -756,6 +1171,39 @@ impl Item for TableDataView {
         Some("Database Table Data Opened")
     }
 
+    fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
+        ItemBufferKind::Singleton
+    }
+
+    fn is_dirty(&self, _cx: &App) -> bool {
+        self.has_pending_changes()
+    }
+
+    fn can_save(&self, _cx: &App) -> bool {
+        self.can_edit() && self.has_pending_changes() && !self.is_saving
+    }
+
+    fn save(
+        &mut self,
+        _options: SaveOptions,
+        _project: Entity<Project>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.save_changes_task(cx)
+    }
+
+    fn reload(
+        &mut self,
+        _project: Entity<Project>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.discard_changes(cx);
+        TableDataView::reload(self, cx);
+        Task::ready(Ok(()))
+    }
+
     fn show_toolbar(&self) -> bool {
         false
     }
@@ -788,10 +1236,19 @@ impl Render for TableDataView {
                                 .is_none_or(|original| original != &row.values)
                     });
                 data.change_count()
-                    + usize::from(self.editing_cell.is_some() && !active_row_is_counted)
+                    + usize::from(
+                        self.editing_cell
+                            .as_ref()
+                            .is_some_and(|editor| editor.edited.get())
+                            && !active_row_is_counted,
+                    )
             }
             _ => 0,
         };
+        let selected_row_deleted = self.selected_row.and_then(|row_index| match &self.state {
+            TableDataState::Loaded(data) => data.rows.get(row_index).map(|row| row.deleted),
+            _ => None,
+        });
         let editing_status = match &self.state {
             TableDataState::Loaded(_) if self.profile.read_only => {
                 Some("Editing disabled: connection is read-only")
@@ -803,7 +1260,7 @@ impl Render for TableDataView {
                 Some("Editing disabled: one or more cell values were truncated")
             }
             TableDataState::Loaded(_) => {
-                Some("Double-click a cell to edit it; type NULL to store SQL NULL")
+                Some("Select a row for row actions; double-click a cell to edit it")
             }
             _ => None,
         };
@@ -811,6 +1268,17 @@ impl Render for TableDataView {
             .id("database-table-data")
             .key_context("DatabaseTableData")
             .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                let where_focused = this
+                    .where_clause
+                    .focus_handle(cx)
+                    .contains_focused(window, cx);
+                let order_focused = this.order_by.focus_handle(cx).contains_focused(window, cx);
+                if where_focused || order_focused {
+                    cx.stop_propagation();
+                    this.request_navigation(TableNavigation::Reload { page: 0 }, window, cx);
+                }
+            }))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(
@@ -824,11 +1292,17 @@ impl Render for TableDataView {
                     .child(div().min_w_0().flex_1().child(self.where_clause.clone()))
                     .child(div().min_w_0().flex_1().child(self.order_by.clone()))
                     .child(
-                        Button::new("refresh-database-table-data", "Apply")
-                            .style(ButtonStyle::Filled)
+                        Button::new("refresh-database-table-data", "Refresh")
+                            .style(ButtonStyle::Outlined)
                             .start_icon(Icon::new(IconName::RefreshTitle))
-                            .disabled(has_changes || self.is_saving)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            .disabled(self.is_saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.request_navigation(
+                                    TableNavigation::Reload { page: this.page },
+                                    window,
+                                    cx,
+                                )
+                            })),
                     ),
             )
             .child(
@@ -848,6 +1322,24 @@ impl Render for TableDataView {
                         )
                     })
                     .child(div().flex_1())
+                    .child(
+                        Button::new(
+                            "delete-selected-database-table-row",
+                            if selected_row_deleted == Some(true) {
+                                "Restore Row"
+                            } else {
+                                "Delete Row"
+                            },
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .start_icon(Icon::new(if selected_row_deleted == Some(true) {
+                            IconName::RotateCcw
+                        } else {
+                            IconName::Trash
+                        }))
+                        .disabled(!can_edit || selected_row_deleted.is_none() || self.is_saving)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_selected_row(cx))),
+                    )
                     .child(
                         Button::new("add-database-table-row", "Add Row")
                             .style(ButtonStyle::Outlined)
