@@ -166,6 +166,7 @@ impl TableDataView {
         profile: ConnectionProfile,
         table: MetadataTable,
         workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -179,38 +180,34 @@ impl TableDataView {
                 .label("ORDER BY")
                 .tab_index(1)
         });
-        let language_tasks = workspace
-            .upgrade()
-            .map(|workspace| workspace.read(cx).project().clone())
-            .map(|project| {
-                let language_registry = project.read(cx).languages().clone();
-                [where_clause.clone(), order_by.clone()]
-                    .into_iter()
-                    .filter_map(|input| {
-                        let editor = input
-                            .read(cx)
-                            .editor()
-                            .as_any()
-                            .downcast_ref::<Entity<Editor>>()?
-                            .clone();
-                        let buffer = editor.read(cx).active_buffer(cx)?;
-                        buffer.update(cx, |buffer, _| {
-                            buffer.set_language_registry(language_registry.clone())
-                        });
-                        let language_registry = language_registry.clone();
-                        Some(cx.spawn(async move |_, cx| {
-                            let Ok(language) = language_registry
-                                .load_language_for_file_path(Path::new("filter.sql"))
-                                .await
-                            else {
-                                return;
-                            };
-                            buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
-                        }))
-                    })
-                    .collect()
+        // Table views are constructed from inside `Workspace::update`. Use the
+        // injected project instead of re-reading the already leased workspace.
+        let language_registry = project.read(cx).languages().clone();
+        let language_tasks = [where_clause.clone(), order_by.clone()]
+            .into_iter()
+            .filter_map(|input| {
+                let editor = input
+                    .read(cx)
+                    .editor()
+                    .as_any()
+                    .downcast_ref::<Entity<Editor>>()?
+                    .clone();
+                let buffer = editor.read(cx).active_buffer(cx)?;
+                buffer.update(cx, |buffer, _| {
+                    buffer.set_language_registry(language_registry.clone())
+                });
+                let language_registry = language_registry.clone();
+                Some(cx.spawn(async move |_, cx| {
+                    let Ok(language) = language_registry
+                        .load_language_for_file_path(Path::new("filter.sql"))
+                        .await
+                    else {
+                        return;
+                    };
+                    buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+                }))
             })
-            .unwrap_or_default();
+            .collect();
         Self {
             profile,
             table,
@@ -874,8 +871,16 @@ impl TableDataView {
                 return;
             };
             workspace.update(cx, |workspace, cx| {
+                let project = workspace.project().clone();
                 let view = cx.new(|cx| {
-                    TableDataView::new(profile, relation.table, workspace_handle, window, cx)
+                    TableDataView::new(
+                        profile,
+                        relation.table,
+                        workspace_handle,
+                        project,
+                        window,
+                        cx,
+                    )
                 });
                 view.update(cx, |view, cx| {
                     view.where_clause.update(cx, |input, cx| {

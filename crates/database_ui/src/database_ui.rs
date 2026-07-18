@@ -502,8 +502,10 @@ impl DatabasePanel {
                 return;
             }
 
-            let view =
-                cx.new(|cx| TableDataView::new(profile, table, workspace_handle, window, cx));
+            let project = workspace.project().clone();
+            let view = cx.new(|cx| {
+                TableDataView::new(profile, table, workspace_handle, project, window, cx)
+            });
             view.update(cx, |view, cx| view.refresh(cx));
             workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
         });
