@@ -1122,6 +1122,7 @@ impl DatabasePanel {
                             h_flex()
                                 .w_full()
                                 .gap_2()
+                                .child(div().w(IconSize::XSmall.rems()).flex_none())
                                 .child(
                                     Icon::new(IconName::FileDoc)
                                         .size(IconSize::Small)
