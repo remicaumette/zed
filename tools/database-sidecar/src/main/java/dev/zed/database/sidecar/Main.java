@@ -18,12 +18,19 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.regex.Pattern;
 
 public final class Main {
-    private static final int PROTOCOL_VERSION = 1;
+    private static final int PROTOCOL_VERSION = 2;
     private static final int MAX_FRAME_SIZE = 16 * 1024 * 1024;
     private static final int MAX_CELL_CHARACTERS = 4096;
     private static final int MAX_RESULT_CHARACTERS = 500_000;
@@ -70,6 +77,17 @@ public final class Main {
                     );
                 case "execute":
                     return ResponseEnvelope.success(request.requestId, execute(request));
+                case "listDatabases":
+                    return ResponseEnvelope.success(
+                        request.requestId,
+                        listDatabases(request.connection)
+                    );
+                case "listTables":
+                    return ResponseEnvelope.success(request.requestId, listTables(request));
+                case "describeTable":
+                    return ResponseEnvelope.success(request.requestId, describeTable(request));
+                case "browseTable":
+                    return ResponseEnvelope.success(request.requestId, browseTable(request));
                 default:
                     return ResponseEnvelope.error(
                         request.requestId,
@@ -126,22 +144,66 @@ public final class Main {
 
         DriverManager.setLoginTimeout(Math.max(1, request.connection.timeoutSeconds));
         Instant startedAt = Instant.now();
-        try (Connection connection = openConnection(request.connection);
-             Statement statement = connection.createStatement()) {
+        try (Connection connection = openConnection(request.connection)) {
+            return execute(
+                connection,
+                request.sql,
+                request.maxRows,
+                request.connection.timeoutSeconds,
+                startedAt
+            );
+        }
+    }
+
+    private static QueryResult browseTable(RequestEnvelope request) throws SQLException {
+        if (request.table == null || request.table.isBlank()) {
+            throw new IllegalArgumentException("A table name is required");
+        }
+        if (request.maxRows <= 0) {
+            throw new IllegalArgumentException("maxRows must be greater than zero");
+        }
+
+        DriverManager.setLoginTimeout(Math.max(1, request.connection.timeoutSeconds));
+        Instant startedAt = Instant.now();
+        try (Connection connection = openConnection(request.connection)) {
+            StringBuilder sql = new StringBuilder("SELECT * FROM ")
+                .append(qualifiedTableName(connection, request));
+            if (request.whereClause != null && !request.whereClause.isBlank()) {
+                sql.append(" WHERE ").append(request.whereClause.trim());
+            }
+            if (request.orderBy != null && !request.orderBy.isBlank()) {
+                sql.append(" ORDER BY ").append(request.orderBy.trim());
+            }
+            return execute(
+                connection,
+                sql.toString(),
+                request.maxRows,
+                request.connection.timeoutSeconds,
+                startedAt
+            );
+        }
+    }
+
+    private static QueryResult execute(
+        Connection connection,
+        String sql,
+        int maxRows,
+        int timeoutSeconds,
+        Instant startedAt
+    ) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
             try {
-                statement.setQueryTimeout(Math.max(1, request.connection.timeoutSeconds));
+                statement.setQueryTimeout(Math.max(1, timeoutSeconds));
             } catch (SQLException | UnsupportedOperationException ignored) {
                 // Query timeouts are optional in JDBC drivers.
             }
             try {
-                statement.setMaxRows(request.maxRows == Integer.MAX_VALUE
-                    ? request.maxRows
-                    : request.maxRows + 1);
+                statement.setMaxRows(maxRows == Integer.MAX_VALUE ? maxRows : maxRows + 1);
             } catch (SQLException | UnsupportedOperationException ignored) {
                 // The result reader still enforces the row limit.
             }
 
-            boolean hasResultSet = statement.execute(request.sql);
+            boolean hasResultSet = statement.execute(sql);
             if (!hasResultSet) {
                 int updateCount = statement.getUpdateCount();
                 return new QueryResult(
@@ -170,7 +232,7 @@ public final class Main {
                 int remainingCharacters = MAX_RESULT_CHARACTERS;
                 rowsLoop:
                 while (resultSet.next()) {
-                    if (rows.size() >= request.maxRows) {
+                    if (rows.size() >= maxRows) {
                         truncated = true;
                         break;
                     }
@@ -207,6 +269,241 @@ public final class Main {
                 );
             }
         }
+    }
+
+    private static List<MetadataDatabase> listDatabases(ConnectionRequest request)
+        throws SQLException {
+        DriverManager.setLoginTimeout(Math.max(1, request.timeoutSeconds));
+        try (Connection connection = openConnection(request)) {
+            DatabaseMetaData metadata = connection.getMetaData();
+            List<MetadataDatabase> databases = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+
+            try (ResultSet catalogs = metadata.getCatalogs()) {
+                while (catalogs.next()) {
+                    String catalog = catalogs.getString(1);
+                    addDatabase(databases, seen, catalog, catalog, null);
+                }
+            }
+
+            if (databases.isEmpty()) {
+                try (ResultSet schemas = metadata.getSchemas()) {
+                    while (schemas.next()) {
+                        String schema = schemas.getString("TABLE_SCHEM");
+                        String catalog = nullableString(schemas, "TABLE_CATALOG");
+                        addDatabase(databases, seen, schema, catalog, schema);
+                    }
+                }
+            }
+
+            if (databases.isEmpty()) {
+                String catalog = connection.getCatalog();
+                String schema = null;
+                try {
+                    schema = connection.getSchema();
+                } catch (SQLException | UnsupportedOperationException ignored) {
+                    // Connection schemas are optional.
+                }
+                String name = !isBlank(catalog) ? catalog : (!isBlank(schema) ? schema : "main");
+                addDatabase(databases, seen, name, catalog, schema);
+            }
+
+            databases.sort(Comparator.comparing(
+                database -> database.name,
+                String.CASE_INSENSITIVE_ORDER
+            ));
+            return databases;
+        }
+    }
+
+    private static void addDatabase(
+        List<MetadataDatabase> databases,
+        Set<String> seen,
+        String name,
+        String catalog,
+        String schema
+    ) {
+        if (isBlank(name)) {
+            return;
+        }
+        String key = String.valueOf(catalog) + '\0' + String.valueOf(schema);
+        if (seen.add(key)) {
+            databases.add(new MetadataDatabase(name, catalog, schema));
+        }
+    }
+
+    private static List<MetadataTable> listTables(RequestEnvelope request) throws SQLException {
+        DriverManager.setLoginTimeout(Math.max(1, request.connection.timeoutSeconds));
+        try (Connection connection = openConnection(request.connection)) {
+            DatabaseMetaData metadata = connection.getMetaData();
+            String identifierQuote = identifierQuote(metadata);
+            try (ResultSet tables = metadata.getTables(
+                 request.catalog,
+                 request.schema,
+                 "%",
+                 null
+             )) {
+                List<MetadataTable> result = new ArrayList<>();
+                while (tables.next()) {
+                    String name = tables.getString("TABLE_NAME");
+                    String tableType = tables.getString("TABLE_TYPE");
+                    if (isBlank(name) || !isBrowsableTableType(tableType)) {
+                        continue;
+                    }
+                    result.add(new MetadataTable(
+                        nullableString(tables, "TABLE_CAT"),
+                        nullableString(tables, "TABLE_SCHEM"),
+                        name,
+                        tableType,
+                        identifierQuote
+                    ));
+                }
+                result.sort(
+                    Comparator.comparing(
+                        (MetadataTable table) -> nullToEmpty(table.schema),
+                        String.CASE_INSENSITIVE_ORDER
+                    ).thenComparing(table -> table.name, String.CASE_INSENSITIVE_ORDER)
+                );
+                return result;
+            }
+        }
+    }
+
+    private static TableMetadataDetails describeTable(RequestEnvelope request)
+        throws SQLException {
+        if (request.table == null || request.table.isBlank()) {
+            throw new IllegalArgumentException("A table name is required");
+        }
+        DriverManager.setLoginTimeout(Math.max(1, request.connection.timeoutSeconds));
+        try (Connection connection = openConnection(request.connection)) {
+            DatabaseMetaData metadata = connection.getMetaData();
+            List<MetadataColumn> columns = new ArrayList<>();
+            try (ResultSet result = metadata.getColumns(
+                request.catalog,
+                request.schema,
+                request.table,
+                "%"
+            )) {
+                while (result.next()) {
+                    columns.add(new MetadataColumn(
+                        result.getString("COLUMN_NAME"),
+                        result.getString("TYPE_NAME"),
+                        result.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls,
+                        result.getInt("ORDINAL_POSITION"),
+                        nullableString(result, "COLUMN_DEF")
+                    ));
+                }
+            }
+            columns.sort(Comparator.comparingInt(column -> column.ordinalPosition));
+
+            Map<String, IndexAccumulator> accumulators = new LinkedHashMap<>();
+            try {
+                try (ResultSet result = metadata.getIndexInfo(
+                    request.catalog,
+                    request.schema,
+                    request.table,
+                    false,
+                    true
+                )) {
+                    while (result.next()) {
+                        if (result.getShort("TYPE") == DatabaseMetaData.tableIndexStatistic) {
+                            continue;
+                        }
+                        String name = nullableString(result, "INDEX_NAME");
+                        String column = nullableString(result, "COLUMN_NAME");
+                        if (isBlank(name) || isBlank(column)) {
+                            continue;
+                        }
+                        IndexAccumulator index = accumulators.computeIfAbsent(
+                            name,
+                            key -> new IndexAccumulator(key, !getBoolean(result, "NON_UNIQUE"))
+                        );
+                        index.columns.put((int) result.getShort("ORDINAL_POSITION"), column);
+                    }
+                }
+            } catch (SQLException | UnsupportedOperationException ignored) {
+                // Index metadata is optional for custom and analytical JDBC drivers.
+            }
+
+            List<MetadataIndex> indexes = new ArrayList<>();
+            for (IndexAccumulator accumulator : accumulators.values()) {
+                indexes.add(new MetadataIndex(
+                    accumulator.name,
+                    accumulator.unique,
+                    new ArrayList<>(accumulator.columns.values())
+                ));
+            }
+            indexes.sort(Comparator.comparing(index -> index.name, String.CASE_INSENSITIVE_ORDER));
+            return new TableMetadataDetails(columns, indexes);
+        }
+    }
+
+    private static String qualifiedTableName(Connection connection, RequestEnvelope request)
+        throws SQLException {
+        DatabaseMetaData metadata = connection.getMetaData();
+        String tableName = quoteIdentifier(metadata, request.table);
+
+        if (!isBlank(request.schema) && metadata.supportsSchemasInDataManipulation()) {
+            tableName = quoteIdentifier(metadata, request.schema) + "." + tableName;
+        }
+        if (!isBlank(request.catalog) && metadata.supportsCatalogsInDataManipulation()) {
+            String catalog = quoteIdentifier(metadata, request.catalog);
+            String separator = metadata.getCatalogSeparator();
+            if (isBlank(separator)) {
+                separator = ".";
+            }
+            tableName = metadata.isCatalogAtStart()
+                ? catalog + separator + tableName
+                : tableName + separator + catalog;
+        }
+        return tableName;
+    }
+
+    private static String quoteIdentifier(DatabaseMetaData metadata, String identifier)
+        throws SQLException {
+        String quote = identifierQuote(metadata);
+        if (quote == null) {
+            return identifier;
+        }
+        return quote + identifier.replace(quote, quote + quote) + quote;
+    }
+
+    private static String identifierQuote(DatabaseMetaData metadata) throws SQLException {
+        String quote = metadata.getIdentifierQuoteString();
+        return isBlank(quote) ? null : quote.trim();
+    }
+
+    private static String nullableString(ResultSet result, String column) {
+        try {
+            return result.getString(column);
+        } catch (SQLException ignored) {
+            return null;
+        }
+    }
+
+    private static boolean getBoolean(ResultSet result, String column) {
+        try {
+            return result.getBoolean(column);
+        } catch (SQLException error) {
+            throw new IllegalStateException(error);
+        }
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    private static boolean isBrowsableTableType(String tableType) {
+        if (isBlank(tableType)) {
+            return false;
+        }
+        String normalized = tableType.toUpperCase(Locale.ROOT);
+        return !normalized.startsWith("SYSTEM")
+            && (normalized.contains("TABLE") || normalized.contains("VIEW"));
+    }
+
+    private static String nullToEmpty(String value) {
+        return value == null ? "" : value;
     }
 
     private static Connection openConnection(ConnectionRequest request) throws SQLException {
@@ -260,6 +557,11 @@ public final class Main {
         public ConnectionRequest connection;
         public String sql;
         public int maxRows;
+        public String catalog;
+        public String schema;
+        public String table;
+        public String whereClause;
+        public String orderBy;
     }
 
     public static final class ConnectionRequest {
@@ -350,6 +652,95 @@ public final class Main {
             this.affectedRows = affectedRows;
             this.truncated = truncated;
             this.elapsedMillis = elapsedMillis;
+        }
+    }
+
+    public static final class MetadataDatabase {
+        public final String name;
+        public final String catalog;
+        public final String schema;
+
+        MetadataDatabase(String name, String catalog, String schema) {
+            this.name = name;
+            this.catalog = catalog;
+            this.schema = schema;
+        }
+    }
+
+    public static final class MetadataTable {
+        public final String catalog;
+        public final String schema;
+        public final String name;
+        public final String tableType;
+        public final String identifierQuote;
+
+        MetadataTable(
+            String catalog,
+            String schema,
+            String name,
+            String tableType,
+            String identifierQuote
+        ) {
+            this.catalog = catalog;
+            this.schema = schema;
+            this.name = name;
+            this.tableType = tableType;
+            this.identifierQuote = identifierQuote;
+        }
+    }
+
+    public static final class MetadataColumn {
+        public final String name;
+        public final String typeName;
+        public final boolean nullable;
+        public final int ordinalPosition;
+        public final String defaultValue;
+
+        MetadataColumn(
+            String name,
+            String typeName,
+            boolean nullable,
+            int ordinalPosition,
+            String defaultValue
+        ) {
+            this.name = name;
+            this.typeName = typeName;
+            this.nullable = nullable;
+            this.ordinalPosition = ordinalPosition;
+            this.defaultValue = defaultValue;
+        }
+    }
+
+    public static final class MetadataIndex {
+        public final String name;
+        public final boolean unique;
+        public final List<String> columns;
+
+        MetadataIndex(String name, boolean unique, List<String> columns) {
+            this.name = name;
+            this.unique = unique;
+            this.columns = columns;
+        }
+    }
+
+    public static final class TableMetadataDetails {
+        public final List<MetadataColumn> columns;
+        public final List<MetadataIndex> indexes;
+
+        TableMetadataDetails(List<MetadataColumn> columns, List<MetadataIndex> indexes) {
+            this.columns = columns;
+            this.indexes = indexes;
+        }
+    }
+
+    private static final class IndexAccumulator {
+        final String name;
+        final boolean unique;
+        final Map<Integer, String> columns = new TreeMap<>();
+
+        IndexAccumulator(String name, boolean unique) {
+            this.name = name;
+            this.unique = unique;
         }
     }
 

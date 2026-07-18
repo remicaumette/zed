@@ -8,7 +8,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -38,6 +38,49 @@ pub struct QueryResult {
     pub elapsed_millis: u64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataDatabase {
+    pub name: String,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataTable {
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub name: String,
+    pub table_type: String,
+    pub identifier_quote: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataColumn {
+    pub name: String,
+    pub type_name: String,
+    pub nullable: bool,
+    pub ordinal_position: u32,
+    pub default_value: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataIndex {
+    pub name: String,
+    pub unique: bool,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableMetadataDetails {
+    pub columns: Vec<MetadataColumn>,
+    pub indexes: Vec<MetadataIndex>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RequestEnvelope<'a> {
@@ -49,6 +92,16 @@ struct RequestEnvelope<'a> {
     sql: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_rows: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    where_clause: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order_by: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -93,6 +146,11 @@ pub async fn test_connection(
             connection: connection_request(profile, password),
             sql: None,
             max_rows: None,
+            catalog: None,
+            schema: None,
+            table: None,
+            where_clause: None,
+            order_by: None,
         },
     )
     .await
@@ -121,6 +179,112 @@ pub async fn execute_query(
             connection: connection_request(profile, password),
             sql: Some(sql),
             max_rows: Some(max_rows),
+            catalog: None,
+            schema: None,
+            table: None,
+            where_clause: None,
+            order_by: None,
+        },
+    )
+    .await
+}
+
+pub async fn list_databases(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+) -> Result<Vec<MetadataDatabase>> {
+    invoke(
+        profile,
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: "listDatabases",
+            connection: connection_request(profile, password),
+            sql: None,
+            max_rows: None,
+            catalog: None,
+            schema: None,
+            table: None,
+            where_clause: None,
+            order_by: None,
+        },
+    )
+    .await
+}
+
+pub async fn list_tables(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+    database: &MetadataDatabase,
+) -> Result<Vec<MetadataTable>> {
+    invoke(
+        profile,
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: "listTables",
+            connection: connection_request(profile, password),
+            sql: None,
+            max_rows: None,
+            catalog: database.catalog.as_deref(),
+            schema: database.schema.as_deref(),
+            table: None,
+            where_clause: None,
+            order_by: None,
+        },
+    )
+    .await
+}
+
+pub async fn describe_table(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+    table: &MetadataTable,
+) -> Result<TableMetadataDetails> {
+    invoke(
+        profile,
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: "describeTable",
+            connection: connection_request(profile, password),
+            sql: None,
+            max_rows: None,
+            catalog: table.catalog.as_deref(),
+            schema: table.schema.as_deref(),
+            table: Some(&table.name),
+            where_clause: None,
+            order_by: None,
+        },
+    )
+    .await
+}
+
+pub async fn browse_table(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+    table: &MetadataTable,
+    where_clause: Option<&str>,
+    order_by: Option<&str>,
+    max_rows: u32,
+) -> Result<QueryResult> {
+    if max_rows == 0 {
+        bail!("table row limit must be greater than zero");
+    }
+    invoke(
+        profile,
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: "browseTable",
+            connection: connection_request(profile, password),
+            sql: None,
+            max_rows: Some(max_rows),
+            catalog: table.catalog.as_deref(),
+            schema: table.schema.as_deref(),
+            table: Some(&table.name),
+            where_clause: where_clause.filter(|clause| !clause.trim().is_empty()),
+            order_by: order_by.filter(|order| !order.trim().is_empty()),
         },
     )
     .await
@@ -288,6 +452,11 @@ mod tests {
             },
             sql: None,
             max_rows: None,
+            catalog: None,
+            schema: None,
+            table: None,
+            where_clause: None,
+            order_by: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -340,6 +509,70 @@ mod tests {
         .unwrap();
         assert_eq!(result.rows.len(), 10);
         assert!(result.truncated);
+    }
+
+    #[test]
+    #[ignore = "requires Java and a built JDBC sidecar"]
+    fn browses_sqlite_metadata_and_table_data_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("metadata-smoke-test.sqlite");
+        let mut profile = ConnectionProfile::new("Metadata smoke test", DatabaseDriver::Sqlite);
+        profile.jdbc_url = format!("jdbc:sqlite:{}", database_path.display());
+        profile.read_only = false;
+
+        smol::block_on(execute_query(
+            &profile,
+            None,
+            "create table widgets(id integer primary key, name text not null, score integer)",
+            100,
+        ))
+        .unwrap();
+        smol::block_on(execute_query(
+            &profile,
+            None,
+            "create unique index widgets_name_idx on widgets(name)",
+            100,
+        ))
+        .unwrap();
+        smol::block_on(execute_query(
+            &profile,
+            None,
+            "insert into widgets(name, score) values ('alpha', 2), ('beta', 1)",
+            100,
+        ))
+        .unwrap();
+
+        let databases = smol::block_on(list_databases(&profile, None)).unwrap();
+        assert_eq!(databases.len(), 1);
+        let tables = smol::block_on(list_tables(&profile, None, &databases[0])).unwrap();
+        let widgets = tables.iter().find(|table| table.name == "widgets").unwrap();
+        let details = smol::block_on(describe_table(&profile, None, widgets)).unwrap();
+        assert_eq!(
+            details
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "score"]
+        );
+        assert!(
+            details
+                .indexes
+                .iter()
+                .any(|index| index.name == "widgets_name_idx" && index.unique)
+        );
+
+        let result = smol::block_on(browse_table(
+            &profile,
+            None,
+            widgets,
+            Some("score >= 1"),
+            Some("score asc"),
+            100,
+        ))
+        .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][1], Some("beta".into()));
     }
 
     #[test]

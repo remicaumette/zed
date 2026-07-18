@@ -12,7 +12,11 @@ mod sql;
 pub use driver_manager::{
     JdbcDriverDownload, download_jdbc_driver, installed_jdbc_driver_path, resolve_jdbc_driver_path,
 };
-pub use sidecar::{ConnectionTestResult, QueryColumn, QueryResult, execute_query, test_connection};
+pub use sidecar::{
+    ConnectionTestResult, MetadataColumn, MetadataDatabase, MetadataIndex, MetadataTable,
+    QueryColumn, QueryResult, TableMetadataDetails, browse_table, describe_table, execute_query,
+    list_databases, list_tables, test_connection,
+};
 pub use sql::{split_sql_statements, sql_statement_at_offset};
 
 /// Version of the serialized connection registry.

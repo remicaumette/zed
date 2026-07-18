@@ -15,9 +15,10 @@ The first supported databases are PostgreSQL, MySQL, ClickHouse, and SQLite.
 
 Last updated: July 18, 2026.
 
-The project now spans milestones 0, 1, and the first vertical slice of milestone 3. Connection profiles can be edited and tested against a real database. Each
-saved connection can own multiple workspace-local SQL consoles backed by Zed's
-native editor and the JDBC sidecar.
+The project now spans milestones 0 through 3. Connection profiles can be edited
+and tested against a real database. Each saved connection can own multiple
+workspace-local SQL consoles, lazily browse JDBC metadata, and open table data
+in a native Zed view.
 
 - [x] Add versioned connection profile types.
 - [x] Validate JDBC URLs without storing secrets in the profile.
@@ -35,6 +36,9 @@ native editor and the JDBC sidecar.
 - [x] Parse and execute the selection, the current statement, or the whole document.
 - [x] Display one result tab per executed statement in a dedicated bottom panel.
 - [x] Display bounded rows, affected-row counts, durations, truncation, and errors.
+- [x] Lazily list databases, tables, views, columns, and indexes through JDBC metadata.
+- [x] Open a table data tab with optional `WHERE` and `ORDER BY` fragments.
+- [x] Cycle ascending, descending, and unsorted order by selecting a result column.
 - [x] Exercise the complete protocol against a temporary SQLite database.
 - [ ] Run contract tests against PostgreSQL, MySQL, and ClickHouse containers.
 - [ ] Package the sidecar as part of release builds.
@@ -63,7 +67,7 @@ of Cargo's dependency graph. The sidecar itself contains no database-specific
 driver: Zed adds the selected JAR to the Java classpath and `DriverManager`
 discovers it from the JDBC URL.
 
-Protocol version 1 uses length-prefixed JSON envelopes. Each request has an ID
+Protocol version 2 uses length-prefixed JSON envelopes. Each request has an ID
 and an explicit protocol version. Standard output is reserved for protocol
 frames; diagnostics go to standard error. An incompatible version is rejected
 with an actionable error. The initial query operation returns at most 200 rows,
@@ -125,8 +129,12 @@ driver reuse without pretending every database exposes identical metadata.
 
 ## Object explorer
 
-The explorer will load children lazily and cache metadata per connection. The
-target object model includes:
+The explorer loads databases, tables, columns, and indexes lazily and caches
+metadata for the current connection. Discovery stays generic: the sidecar uses
+`DatabaseMetaData` instead of branching on the selected driver. Schemas are
+currently flattened into qualified table labels below each database.
+
+The target object model includes:
 
 - catalogs and schemas;
 - tables, views, and materialized views;
@@ -163,8 +171,10 @@ sidecar restart does not require restarting Zed.
 
 ### Milestone 2: object explorer
 
-- Lazy catalogs, schemas, tables, views, columns, keys, and indexes.
-- Refresh at connection and subtree level.
+- [x] Lazy databases, tables, views, columns, and indexes.
+- [x] Refresh at database-root level.
+- Add explicit schema nodes, keys, constraints, functions, and procedures.
+- Add refresh at every subtree level.
 - Search and filtering.
 - Copy qualified name and generate basic SQL actions.
 
@@ -189,8 +199,8 @@ configured bound.
 ### Milestone 4: DataGrip-style workflows
 
 - Persistent result tabs and query history across executions.
+- Editable table data with safe primary-key requirements.
 - DDL preview, data export, and explain plans.
-- Safe data editing with explicit primary-key requirements.
 - Schema diff and richer database-specific object support.
 
 This milestone will be split into smaller proposals before implementation.
@@ -210,6 +220,7 @@ Run the smallest relevant checks during development:
 cargo test -p database
 cargo test -p database sidecar::tests::connects_to_sqlite_end_to_end -- --ignored --exact
 cargo test -p database sidecar::tests::executes_sqlite_query_end_to_end -- --ignored --exact
+cargo test -p database sidecar::tests::browses_sqlite_metadata_and_table_data_end_to_end -- --ignored --exact
 cargo test -p database sidecar::tests::resolves_all_managed_jdbc_drivers -- --ignored --exact
 cargo check -p database_ui
 cargo check -p zed
@@ -265,6 +276,20 @@ For the current connection-editor, SQL console, and JDBC slice:
 18. Remove the profile, restart Zed, and confirm that it and its consoles stay
     removed.
 
+For metadata and table data:
+
+1. Expand a connection, then expand **Databases**.
+2. Expand a database and confirm that its tables and views appear. Schema names
+   are included in table labels when the JDBC driver returns them.
+3. Select the chevron beside a table and confirm that **Columns** and **Indexes**
+   appear below it, including types, nullability, indexed columns, and uniqueness.
+4. Select the table row itself and confirm that a central data tab opens with at
+   most 200 rows.
+5. Enter an expression such as `score >= 10` in **WHERE**, then select **Apply**.
+6. Enter `created_at desc` in **ORDER BY**, then select **Apply**.
+7. Select a column header three times. Confirm that **ORDER BY** changes to
+   ascending, then descending, then empty, and that data reloads after each click.
+
 Also create a **Custom JDBC** connection, select a local driver JAR with
 **Browse**, and confirm that Zed uses it without copying or downloading it.
 
@@ -278,10 +303,11 @@ jdbc:clickhouse://localhost:8123/default
 jdbc:sqlite:database.sqlite
 ```
 
-The sidecar currently starts once per connection test or statement. Statements
-selected together therefore execute in order but do not yet share a JDBC
-session or transaction. Persistent process management, cancellation, metadata
-browsing, and stored-routine delimiter handling are the next runtime slices.
+The sidecar currently starts once per connection test, metadata request, or
+statement. Statements selected together therefore execute in order but do not
+yet share a JDBC session or transaction. Persistent process management,
+cancellation, metadata search, explicit schema nodes, and stored-routine
+delimiter handling are the next runtime slices.
 
 ## Decisions
 

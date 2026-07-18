@@ -1,24 +1,28 @@
 mod connection_editor;
 mod console;
 mod results_panel;
+mod table_data;
 
+use anyhow::{Context as _, Result};
 use connection_editor::ConnectionEditorModal;
 use console::DatabaseConsole;
 use database::{
     ConnectionId, ConnectionProfile, ConnectionRegistry, ConsoleId, ConsoleRegistry,
-    DatabaseDriver, QueryConsole,
+    DatabaseDriver, MetadataDatabase, MetadataTable, QueryConsole, TableMetadataDetails,
+    describe_table, list_databases, list_tables,
 };
 use db::kvp::KeyValueStore;
 use gpui::{
-    Action, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, Pixels, Render, StatefulInteractiveElement, Task, WeakEntity, Window,
-    px,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, IntoElement, Pixels, Render, StatefulInteractiveElement, Task,
+    WeakEntity, Window, px,
 };
 pub use results_panel::DatabaseResultsPanel;
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
 };
+use table_data::TableDataView;
 use ui::{
     Button, ButtonStyle, Color, Icon, IconButton, IconName, IconSize, Label, LabelSize, ListItem,
     Tooltip, prelude::*,
@@ -63,6 +67,8 @@ pub struct DatabasePanel {
     console_registry: ConsoleRegistry,
     console_storage_key: Option<String>,
     expanded_connections: HashSet<ConnectionId>,
+    expanded_database_groups: HashSet<ConnectionId>,
+    metadata_states: HashMap<ConnectionId, ConnectionMetadataState>,
     connection_states: HashMap<ConnectionId, ConnectionState>,
     pending_console_persist: Task<()>,
 }
@@ -71,6 +77,24 @@ pub struct DatabasePanel {
 pub(crate) enum ConnectionState {
     Connected,
     Error,
+}
+
+#[derive(Clone, Default)]
+enum MetadataLoadState<T> {
+    #[default]
+    NotLoaded,
+    Loading,
+    Loaded(T),
+    Error(String),
+}
+
+#[derive(Default)]
+struct ConnectionMetadataState {
+    databases: MetadataLoadState<Vec<MetadataDatabase>>,
+    expanded_databases: HashSet<MetadataDatabase>,
+    tables: HashMap<MetadataDatabase, MetadataLoadState<Vec<MetadataTable>>>,
+    expanded_tables: HashSet<MetadataTable>,
+    details: HashMap<MetadataTable, MetadataLoadState<TableMetadataDetails>>,
 }
 
 impl DatabasePanel {
@@ -128,6 +152,8 @@ impl DatabasePanel {
                 console_registry,
                 console_storage_key,
                 expanded_connections,
+                expanded_database_groups: HashSet::default(),
+                metadata_states: HashMap::default(),
                 connection_states: HashMap::default(),
                 pending_console_persist: Task::ready(()),
             })
@@ -252,6 +278,226 @@ impl DatabasePanel {
         });
     }
 
+    async fn saved_password(
+        profile: &ConnectionProfile,
+        credentials_provider: &dyn credentials_provider::CredentialsProvider,
+        cx: &gpui::AsyncApp,
+    ) -> Result<Option<String>> {
+        credentials_provider
+            .read_credentials(&profile.id.credential_key(), cx)
+            .await?
+            .map(|(_, password)| {
+                String::from_utf8(password).context("saved database password is not valid UTF-8")
+            })
+            .transpose()
+    }
+
+    fn load_databases(&mut self, profile: ConnectionProfile, cx: &mut Context<Self>) {
+        let id = profile.id;
+        self.metadata_states.entry(id).or_default().databases = MetadataLoadState::Loading;
+        let credentials_provider = zed_credentials_provider::global(cx);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let password =
+                    Self::saved_password(&profile, credentials_provider.as_ref(), cx).await?;
+                list_databases(&profile, password.as_deref()).await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                let metadata = this.metadata_states.entry(id).or_default();
+                metadata.databases = match result {
+                    Ok(databases) => {
+                        this.connection_states
+                            .insert(id, ConnectionState::Connected);
+                        MetadataLoadState::Loaded(databases)
+                    }
+                    Err(error) => {
+                        this.connection_states.insert(id, ConnectionState::Error);
+                        MetadataLoadState::Error(error.to_string())
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_tables(
+        &mut self,
+        profile: ConnectionProfile,
+        database: MetadataDatabase,
+        cx: &mut Context<Self>,
+    ) {
+        let id = profile.id;
+        self.metadata_states
+            .entry(id)
+            .or_default()
+            .tables
+            .insert(database.clone(), MetadataLoadState::Loading);
+        let credentials_provider = zed_credentials_provider::global(cx);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let password =
+                    Self::saved_password(&profile, credentials_provider.as_ref(), cx).await?;
+                list_tables(&profile, password.as_deref(), &database).await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                let state = match result {
+                    Ok(tables) => MetadataLoadState::Loaded(tables),
+                    Err(error) => MetadataLoadState::Error(error.to_string()),
+                };
+                this.metadata_states
+                    .entry(id)
+                    .or_default()
+                    .tables
+                    .insert(database, state);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_table_details(
+        &mut self,
+        profile: ConnectionProfile,
+        table: MetadataTable,
+        cx: &mut Context<Self>,
+    ) {
+        let id = profile.id;
+        self.metadata_states
+            .entry(id)
+            .or_default()
+            .details
+            .insert(table.clone(), MetadataLoadState::Loading);
+        let credentials_provider = zed_credentials_provider::global(cx);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let password =
+                    Self::saved_password(&profile, credentials_provider.as_ref(), cx).await?;
+                describe_table(&profile, password.as_deref(), &table).await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                let state = match result {
+                    Ok(details) => MetadataLoadState::Loaded(details),
+                    Err(error) => MetadataLoadState::Error(error.to_string()),
+                };
+                this.metadata_states
+                    .entry(id)
+                    .or_default()
+                    .details
+                    .insert(table, state);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_database_group(&mut self, profile: ConnectionProfile, cx: &mut Context<Self>) {
+        let id = profile.id;
+        if self.expanded_database_groups.remove(&id) {
+            cx.notify();
+            return;
+        }
+        self.expanded_database_groups.insert(id);
+        let should_load = matches!(
+            self.metadata_states
+                .get(&id)
+                .map(|metadata| &metadata.databases),
+            None | Some(MetadataLoadState::NotLoaded | MetadataLoadState::Error(_))
+        );
+        if should_load {
+            self.load_databases(profile, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn toggle_metadata_database(
+        &mut self,
+        profile: ConnectionProfile,
+        database: MetadataDatabase,
+        cx: &mut Context<Self>,
+    ) {
+        let metadata = self.metadata_states.entry(profile.id).or_default();
+        if metadata.expanded_databases.remove(&database) {
+            cx.notify();
+            return;
+        }
+        metadata.expanded_databases.insert(database.clone());
+        let should_load = matches!(
+            metadata.tables.get(&database),
+            None | Some(MetadataLoadState::NotLoaded | MetadataLoadState::Error(_))
+        );
+        if should_load {
+            self.load_tables(profile, database, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn toggle_metadata_table(
+        &mut self,
+        profile: ConnectionProfile,
+        table: MetadataTable,
+        cx: &mut Context<Self>,
+    ) {
+        let metadata = self.metadata_states.entry(profile.id).or_default();
+        if metadata.expanded_tables.remove(&table) {
+            cx.notify();
+            return;
+        }
+        metadata.expanded_tables.insert(table.clone());
+        let should_load = matches!(
+            metadata.details.get(&table),
+            None | Some(MetadataLoadState::NotLoaded | MetadataLoadState::Error(_))
+        );
+        if should_load {
+            self.load_table_details(profile, table, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn open_table_data(
+        &mut self,
+        profile: ConnectionProfile,
+        table: MetadataTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            log::error!("database panel workspace was dropped");
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let existing = workspace.panes().iter().find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<TableDataView>())
+                    .find(|item| item.read(cx).matches(profile.id, &table))
+            });
+            if let Some(existing) = existing {
+                workspace.activate_item(&existing, true, true, window, cx);
+                return;
+            }
+
+            let view = cx.new(|cx| TableDataView::new(profile, table, window, cx));
+            view.update(cx, |view, cx| view.refresh(cx));
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
+    }
+
     pub(crate) fn update_console_sql(
         &mut self,
         id: ConsoleId,
@@ -322,6 +568,8 @@ impl DatabasePanel {
             .consoles
             .retain(|console| console.connection_id != id);
         self.expanded_connections.remove(&id);
+        self.expanded_database_groups.remove(&id);
+        self.metadata_states.remove(&id);
         self.connection_states.remove(&id);
         self.persist(cx);
         self.persist_consoles(cx);
@@ -387,6 +635,424 @@ impl DatabasePanel {
             }))
     }
 
+    fn render_metadata_message(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        indent: usize,
+        message: impl Into<gpui::SharedString>,
+        color: Color,
+    ) -> AnyElement {
+        ListItem::new(id)
+            .inset(true)
+            .indent_level(indent)
+            .disabled(true)
+            .child(Label::new(message).size(LabelSize::Small).color(color))
+            .into_any_element()
+    }
+
+    fn render_table_details(
+        &self,
+        connection_id: ConnectionId,
+        database_index: usize,
+        table_index: usize,
+        state: MetadataLoadState<TableMetadataDetails>,
+    ) -> Vec<AnyElement> {
+        match state {
+            MetadataLoadState::NotLoaded | MetadataLoadState::Loading => {
+                vec![self.render_metadata_message(
+                    format!(
+                        "metadata-details-loading-{connection_id}-{database_index}-{table_index}"
+                    ),
+                    4,
+                    "Loading columns and indexes…",
+                    Color::Muted,
+                )]
+            }
+            MetadataLoadState::Error(error) => vec![self.render_metadata_message(
+                format!("metadata-details-error-{connection_id}-{database_index}-{table_index}"),
+                4,
+                error,
+                Color::Error,
+            )],
+            MetadataLoadState::Loaded(details) => {
+                let mut nodes = vec![self.render_metadata_message(
+                    format!("metadata-columns-{connection_id}-{database_index}-{table_index}"),
+                    4,
+                    format!("Columns ({})", details.columns.len()),
+                    Color::Muted,
+                )];
+                nodes.extend(
+                    details
+                        .columns
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, column)| {
+                            ListItem::new(format!(
+                                "metadata-column-{connection_id}-{database_index}-{table_index}-{index}"
+                            ))
+                            .inset(true)
+                            .indent_level(5)
+                            .disabled(true)
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(IconName::Hash)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(Label::new(column.name).truncate())
+                                    .child(
+                                        Label::new(column.type_name)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                    .when(!column.nullable, |this| {
+                                        this.child(
+                                            Label::new("not null")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    }),
+                            )
+                            .into_any_element()
+                        }),
+                );
+                nodes.push(self.render_metadata_message(
+                    format!("metadata-indexes-{connection_id}-{database_index}-{table_index}"),
+                    4,
+                    format!("Indexes ({})", details.indexes.len()),
+                    Color::Muted,
+                ));
+                if details.indexes.is_empty() {
+                    nodes.push(self.render_metadata_message(
+                        format!(
+                            "metadata-no-indexes-{connection_id}-{database_index}-{table_index}"
+                        ),
+                        5,
+                        "No indexes",
+                        Color::Muted,
+                    ));
+                } else {
+                    nodes.extend(
+                        details
+                            .indexes
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, item)| {
+                                ListItem::new(format!(
+                                    "metadata-index-{connection_id}-{database_index}-{table_index}-{index}"
+                                ))
+                                .inset(true)
+                                .indent_level(5)
+                                .disabled(true)
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::ListTree)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(Label::new(item.name).truncate())
+                                        .when(item.unique, |this| {
+                                            this.child(
+                                                Label::new("unique")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                        })
+                                        .child(
+                                            Label::new(item.columns.join(", "))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .truncate(),
+                                        ),
+                                )
+                                .into_any_element()
+                            }),
+                    );
+                }
+                nodes
+            }
+        }
+    }
+
+    fn render_tables(
+        &self,
+        profile: &ConnectionProfile,
+        database_index: usize,
+        state: MetadataLoadState<Vec<MetadataTable>>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let connection_id = profile.id;
+        match state {
+            MetadataLoadState::NotLoaded | MetadataLoadState::Loading => {
+                vec![self.render_metadata_message(
+                    format!("metadata-tables-loading-{connection_id}-{database_index}"),
+                    3,
+                    "Loading tables…",
+                    Color::Muted,
+                )]
+            }
+            MetadataLoadState::Error(error) => vec![self.render_metadata_message(
+                format!("metadata-tables-error-{connection_id}-{database_index}"),
+                3,
+                error,
+                Color::Error,
+            )],
+            MetadataLoadState::Loaded(tables) if tables.is_empty() => {
+                vec![self.render_metadata_message(
+                    format!("metadata-tables-empty-{connection_id}-{database_index}"),
+                    3,
+                    "No tables or views",
+                    Color::Muted,
+                )]
+            }
+            MetadataLoadState::Loaded(tables) => {
+                let metadata = self.metadata_states.get(&connection_id);
+                let mut nodes = Vec::new();
+                for (table_index, table) in tables.into_iter().enumerate() {
+                    let expanded =
+                        metadata.is_some_and(|metadata| metadata.expanded_tables.contains(&table));
+                    let table_label = table
+                        .schema
+                        .as_deref()
+                        .map(|schema| format!("{schema}.{}", table.name))
+                        .unwrap_or_else(|| table.name.clone());
+                    let profile_for_open = profile.clone();
+                    let table_for_open = table.clone();
+                    let profile_for_toggle = profile.clone();
+                    let table_for_toggle = table.clone();
+                    nodes.push(
+                        ListItem::new(format!(
+                            "metadata-table-{connection_id}-{database_index}-{table_index}"
+                        ))
+                        .inset(true)
+                        .indent_level(3)
+                        .on_click(cx.listener(move |panel, _, window, cx| {
+                            panel.open_table_data(
+                                profile_for_open.clone(),
+                                table_for_open.clone(),
+                                window,
+                                cx,
+                            );
+                        }))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .child(
+                                    IconButton::new(
+                                        format!(
+                                            "toggle-table-details-{connection_id}-{database_index}-{table_index}"
+                                        ),
+                                        if expanded {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        },
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Show columns and indexes"))
+                                    .on_click(cx.listener(move |panel, _, _, cx| {
+                                        cx.stop_propagation();
+                                        panel.toggle_metadata_table(
+                                            profile_for_toggle.clone(),
+                                            table_for_toggle.clone(),
+                                            cx,
+                                        );
+                                    })),
+                                )
+                                .child(
+                                    Icon::new(IconName::FileTree)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(table_label).truncate())
+                                .child(
+                                    Label::new(table.table_type.to_lowercase())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .into_any_element(),
+                    );
+                    if expanded {
+                        let details = metadata
+                            .and_then(|metadata| metadata.details.get(&table))
+                            .cloned()
+                            .unwrap_or_default();
+                        nodes.extend(self.render_table_details(
+                            connection_id,
+                            database_index,
+                            table_index,
+                            details,
+                        ));
+                    }
+                }
+                nodes
+            }
+        }
+    }
+
+    fn render_databases(
+        &self,
+        profile: &ConnectionProfile,
+        databases: Vec<MetadataDatabase>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let connection_id = profile.id;
+        let metadata = self.metadata_states.get(&connection_id);
+        let mut nodes = Vec::new();
+        for (database_index, database) in databases.into_iter().enumerate() {
+            let expanded =
+                metadata.is_some_and(|metadata| metadata.expanded_databases.contains(&database));
+            let profile_for_toggle = profile.clone();
+            let database_for_toggle = database.clone();
+            nodes.push(
+                ListItem::new(format!(
+                    "metadata-database-{connection_id}-{database_index}"
+                ))
+                .inset(true)
+                .indent_level(2)
+                .on_click(cx.listener(move |panel, _, _, cx| {
+                    panel.toggle_metadata_database(
+                        profile_for_toggle.clone(),
+                        database_for_toggle.clone(),
+                        cx,
+                    );
+                }))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Icon::new(IconName::DatabaseZap)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(database.name.clone()).truncate()),
+                )
+                .into_any_element(),
+            );
+            if expanded {
+                let tables = metadata
+                    .and_then(|metadata| metadata.tables.get(&database))
+                    .cloned()
+                    .unwrap_or_default();
+                nodes.extend(self.render_tables(profile, database_index, tables, cx));
+            }
+        }
+        nodes
+    }
+
+    fn render_database_group(
+        &self,
+        profile: ConnectionProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let connection_id = profile.id;
+        let expanded = self.expanded_database_groups.contains(&connection_id);
+        let state = self
+            .metadata_states
+            .get(&connection_id)
+            .map(|metadata| metadata.databases.clone())
+            .unwrap_or_default();
+        let profile_for_toggle = profile.clone();
+        let profile_for_refresh = profile.clone();
+        let mut group = v_flex().w_full().child(
+            ListItem::new(format!("metadata-databases-{connection_id}"))
+                .inset(true)
+                .indent_level(1)
+                .on_click(cx.listener(move |panel, _, _, cx| {
+                    panel.toggle_database_group(profile_for_toggle.clone(), cx)
+                }))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Icon::new(IconName::Server)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new("Databases").flex_1())
+                        .child(
+                            IconButton::new(
+                                format!("refresh-databases-{connection_id}"),
+                                IconName::RefreshTitle,
+                            )
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Refresh databases"))
+                            .on_click(cx.listener(
+                                move |panel, _, _, cx| {
+                                    cx.stop_propagation();
+                                    panel.load_databases(profile_for_refresh.clone(), cx);
+                                },
+                            )),
+                        ),
+                ),
+        );
+
+        if expanded {
+            group = match state {
+                MetadataLoadState::NotLoaded | MetadataLoadState::Loading => {
+                    group.child(self.render_metadata_message(
+                        format!("metadata-databases-loading-{connection_id}"),
+                        2,
+                        "Loading databases…",
+                        Color::Muted,
+                    ))
+                }
+                MetadataLoadState::Error(error) => group.child(self.render_metadata_message(
+                    format!("metadata-databases-error-{connection_id}"),
+                    2,
+                    error,
+                    Color::Error,
+                )),
+                MetadataLoadState::Loaded(databases) if databases.is_empty() => {
+                    group.child(self.render_metadata_message(
+                        format!("metadata-databases-empty-{connection_id}"),
+                        2,
+                        "No databases reported by the JDBC driver",
+                        Color::Muted,
+                    ))
+                }
+                MetadataLoadState::Loaded(databases) => {
+                    group.children(self.render_databases(&profile, databases, cx))
+                }
+            };
+        }
+        group.into_any_element()
+    }
+
     fn render_connection(
         &self,
         profile: ConnectionProfile,
@@ -401,6 +1067,7 @@ impl DatabasePanel {
             .filter(|console| console.connection_id == id)
             .cloned()
             .collect::<Vec<_>>();
+        let profile_for_metadata = profile.clone();
         let connection_state = self.connection_states.get(&id).cloned();
         v_flex()
             .w_full()
@@ -513,6 +1180,7 @@ impl DatabasePanel {
                                 .child(Label::new(console.name).truncate()),
                         )
                 }))
+                .child(self.render_database_group(profile_for_metadata, cx))
             })
     }
 }
