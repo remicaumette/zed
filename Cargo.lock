@@ -4941,6 +4941,7 @@ name = "database_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "credentials_provider",
  "database",
  "db",

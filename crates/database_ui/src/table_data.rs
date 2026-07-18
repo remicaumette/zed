@@ -1,6 +1,7 @@
 use std::{cell::Cell, collections::HashSet, rc::Rc};
 
 use anyhow::{Context as _, Result, anyhow};
+use chrono::Local;
 use database::{
     ConnectionId, ConnectionProfile, MetadataColumn, MetadataForeignKey, MetadataTable,
     QueryColumn, QueryResult, TableChanges, TableInsert, TableMetadataDetails, TableMutationCell,
@@ -12,14 +13,16 @@ use gpui::{
 };
 use project::Project;
 use ui::{
-    Banner, Button, ButtonStyle, Color, ContextMenu, Icon, IconName, Label, LabelSize, Severity,
-    Table, prelude::*, right_click_menu,
+    Banner, Button, ButtonStyle, Color, ContextMenu, Icon, IconButton, IconButtonShape, IconName,
+    Label, LabelSize, PopoverMenu, Severity, Table, prelude::*, right_click_menu,
 };
 use ui_input::{ErasedEditorEvent, InputField};
 use workspace::{
     Item, Workspace,
     item::{ItemBufferKind, SaveOptions},
 };
+
+use crate::date_picker::{DatePicker, TemporalCellKind, date_from_value};
 
 const TABLE_DATA_PAGE_SIZE: u32 = 100;
 
@@ -113,6 +116,7 @@ struct ActiveCellEditor {
     input: Entity<InputField>,
     original: Option<String>,
     edited: Rc<Cell<bool>>,
+    date_picker_open: Rc<Cell<bool>>,
     _input_subscription: Subscription,
     _focus_out_subscription: Subscription,
 }
@@ -431,16 +435,22 @@ impl TableDataView {
             cx,
         );
         let focus_handle = input.focus_handle(cx);
-        let focus_out_subscription = cx.on_focus_out(&focus_handle, window, |this, _, _, cx| {
-            this.commit_active_edit(cx);
-            cx.notify();
-        });
+        let date_picker_open = Rc::new(Cell::new(false));
+        let date_picker_open_for_focus = date_picker_open.clone();
+        let focus_out_subscription =
+            cx.on_focus_out(&focus_handle, window, move |this, _, _, cx| {
+                if !date_picker_open_for_focus.get() {
+                    this.commit_active_edit(cx);
+                    cx.notify();
+                }
+            });
         self.editing_cell = Some(ActiveCellEditor {
             row,
             column,
             input,
             original: value,
             edited,
+            date_picker_open,
             _input_subscription: input_subscription,
             _focus_out_subscription: focus_out_subscription,
         });
@@ -806,26 +816,33 @@ impl TableDataView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            self.save_error = Some("The workspace is no longer available".into());
-            cx.notify();
-            return;
-        };
         let profile = self.profile.clone();
         let workspace_handle = self.workspace.clone();
-        workspace.update(cx, |workspace, cx| {
-            let view = cx.new(|cx| {
-                TableDataView::new(profile, relation.table, workspace_handle, window, cx)
-            });
-            view.update(cx, |view, cx| {
-                view.where_clause.update(cx, |input, cx| {
-                    input.set_text(&relation.where_clause, window, cx)
+        let source_view = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace_handle.upgrade() else {
+                source_view
+                    .update(cx, |this, cx| {
+                        this.save_error = Some("The workspace is no longer available".into());
+                        cx.notify();
+                    })
+                    .ok();
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                let view = cx.new(|cx| {
+                    TableDataView::new(profile, relation.table, workspace_handle, window, cx)
                 });
-                view.relation_filters = relation.filters;
-                view.relation_where_display = Some(relation.where_clause);
-                view.reload(cx);
+                view.update(cx, |view, cx| {
+                    view.where_clause.update(cx, |input, cx| {
+                        input.set_text(&relation.where_clause, window, cx)
+                    });
+                    view.relation_filters = relation.filters;
+                    view.relation_where_display = Some(relation.where_clause);
+                    view.reload(cx);
+                });
+                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
             });
-            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
         });
     }
 
@@ -891,164 +908,232 @@ impl TableDataView {
             .header(headers)
             .column_borders();
         for (row_index, row) in data.rows.iter().enumerate() {
-            let cells =
-                row.values
-                    .iter()
-                    .enumerate()
-                    .map(|(column_index, value)| {
-                        if let Some(editor) = self.editing_cell.as_ref().filter(|editor| {
-                            editor.row == row_index && editor.column == column_index
-                        }) {
-                            return div()
-                                .id((
-                                    "table-data-editor",
-                                    row_index * data.columns.len() + column_index,
-                                ))
-                                .w_full()
-                                .child(editor.input.clone())
-                                .into_any_element();
-                        }
-
-                        let changed = row
-                            .original
-                            .as_ref()
-                            .is_none_or(|original| original.get(column_index) != Some(value));
-                        let uses_default = row.original.is_none()
-                            && !row.edited_columns.contains(&column_index)
-                            && value.is_none()
-                            && data
-                                .columns
-                                .get(column_index)
-                                .and_then(|column| data.metadata_column(&column.label))
-                                .is_some_and(|metadata| {
-                                    metadata.auto_increment || metadata.default_value.is_some()
-                                });
-                        let label = if uses_default {
-                            Label::new("DEFAULT")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                        } else {
-                            match value {
-                                Some(value) => Label::new(value.clone()).size(LabelSize::Small),
-                                None => Label::new("NULL")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            }
-                        }
-                        .when(row.deleted, |label| label.strikethrough());
-                        let cell = div()
-                            .id((
-                                "table-data-cell",
-                                row_index * data.columns.len() + column_index,
-                            ))
-                            .w_full()
-                            .when(row.deleted, |this| {
-                                this.bg(cx.theme().status().deleted_background.opacity(0.35))
-                            })
-                            .when(changed && !row.deleted, |this| {
-                                this.bg(if row.original.is_none() {
-                                    cx.theme().status().created_background.opacity(0.35)
-                                } else {
-                                    cx.theme().status().warning_background.opacity(0.35)
-                                })
-                            })
-                            .when(can_edit && !row.deleted && !self.is_saving, |this| {
-                                this.cursor_text().on_click(cx.listener(
-                                    move |this, event: &ClickEvent, window, cx| {
-                                        if event.click_count() >= 2 {
-                                            this.start_editing(row_index, column_index, window, cx);
-                                        }
-                                    },
-                                ))
-                            })
-                            .child(label)
-                            .into_any_element();
-
-                        let relation_available = self
-                            .relation_for_cell(data, row_index, column_index)
-                            .is_some();
-                        let can_row_action = can_edit && !self.is_saving;
-                        let nullable = data
+            let cells = row
+                .values
+                .iter()
+                .enumerate()
+                .map(|(column_index, value)| {
+                    if let Some(editor) = self
+                        .editing_cell
+                        .as_ref()
+                        .filter(|editor| editor.row == row_index && editor.column == column_index)
+                    {
+                        let temporal_kind = data
                             .columns
                             .get(column_index)
                             .and_then(|column| data.metadata_column(&column.label))
-                            .is_some_and(|column| column.nullable);
-                        let can_set_null = can_row_action && !row.deleted && nullable;
-                        let deleted = row.deleted;
-                        let this = cx.weak_entity();
-                        right_click_menu((
-                            "database-table-cell-menu",
+                            .and_then(|metadata| {
+                                TemporalCellKind::from_metadata(
+                                    metadata.jdbc_type,
+                                    &metadata.type_name,
+                                )
+                            });
+                        let mut editor_element = h_flex()
+                            .id((
+                                "table-data-editor",
+                                row_index * data.columns.len() + column_index,
+                            ))
+                            .w_full()
+                            .min_w_0()
+                            .child(div().min_w_0().flex_1().child(editor.input.clone()));
+
+                        if let Some(temporal_kind) = temporal_kind {
+                            let input_for_picker = editor.input.clone();
+                            let edited = editor.edited.clone();
+                            let date_picker_open = editor.date_picker_open.clone();
+                            let date_picker_open_for_menu = date_picker_open.clone();
+                            let date_picker_open_for_open = date_picker_open;
+                            let view = cx.weak_entity();
+                            editor_element = editor_element.child(
+                                PopoverMenu::new((
+                                    "database-table-date-picker",
+                                    row_index * data.columns.len() + column_index,
+                                ))
+                                .trigger(
+                                    IconButton::new(
+                                        (
+                                            "database-table-date-picker-trigger",
+                                            row_index * data.columns.len() + column_index,
+                                        ),
+                                        IconName::Clock,
+                                    )
+                                    .shape(IconButtonShape::Square)
+                                    .aria_label("Choose date"),
+                                )
+                                .anchor(gpui::Anchor::TopRight)
+                                .on_open(Rc::new(move |_, _| date_picker_open_for_open.set(true)))
+                                .menu(move |_window, cx| {
+                                    let current_value = input_for_picker.read(cx).text(cx);
+                                    let selected = date_from_value(&current_value)
+                                        .unwrap_or_else(|| Local::now().date_naive());
+                                    let input = input_for_picker.clone();
+                                    let edited = edited.clone();
+                                    let view = view.clone();
+                                    let date_picker_open = date_picker_open_for_menu.clone();
+                                    Some(cx.new(|cx| {
+                                        DatePicker::new(
+                                            selected,
+                                            date_picker_open,
+                                            Box::new(move |date, window, cx| {
+                                                let current_value = input.read(cx).text(cx);
+                                                let value = temporal_kind
+                                                    .value_with_date(&current_value, date);
+                                                input.update(cx, |input, cx| {
+                                                    input.set_text(&value, window, cx)
+                                                });
+                                                edited.set(true);
+                                                view.update(cx, |_, cx| cx.notify()).ok();
+                                            }),
+                                            cx,
+                                        )
+                                    }))
+                                }),
+                            );
+                        }
+
+                        return editor_element.into_any_element();
+                    }
+
+                    let changed = row
+                        .original
+                        .as_ref()
+                        .is_none_or(|original| original.get(column_index) != Some(value));
+                    let uses_default = row.original.is_none()
+                        && !row.edited_columns.contains(&column_index)
+                        && value.is_none()
+                        && data
+                            .columns
+                            .get(column_index)
+                            .and_then(|column| data.metadata_column(&column.label))
+                            .is_some_and(|metadata| {
+                                metadata.auto_increment || metadata.default_value.is_some()
+                            });
+                    let label = if uses_default {
+                        Label::new("DEFAULT")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                    } else {
+                        match value {
+                            Some(value) => Label::new(value.clone()).size(LabelSize::Small),
+                            None => Label::new("NULL")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        }
+                    }
+                    .when(row.deleted, |label| label.strikethrough());
+                    let cell = div()
+                        .id((
+                            "table-data-cell",
                             row_index * data.columns.len() + column_index,
                         ))
-                        .trigger(move |_, _, _| cell)
-                        .maybe_menu(move |window, cx| {
-                            this.update(cx, |this, cx| {
-                                this.selected_row = Some(row_index);
-                                cx.notify();
-                            })
-                            .ok();
-                            if !can_row_action && !relation_available {
-                                return None;
-                            }
-
-                            let set_null_view = this.clone();
-                            let delete_view = this.clone();
-                            let relation_view = this.clone();
-                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                if can_set_null {
-                                    menu = menu.entry("Set NULL", None, {
-                                        let set_null_view = set_null_view.clone();
-                                        move |_, cx| {
-                                            set_null_view
-                                                .update(cx, |this, cx| {
-                                                    this.set_cell_null(row_index, column_index, cx)
-                                                })
-                                                .ok();
-                                        }
-                                    });
-                                }
-                                if can_row_action {
-                                    menu = menu.entry(
-                                        if deleted { "Restore Row" } else { "Delete Row" },
-                                        None,
-                                        {
-                                            let delete_view = delete_view.clone();
-                                            move |_, cx| {
-                                                delete_view
-                                                    .update(cx, |this, cx| {
-                                                        this.toggle_delete(row_index, cx)
-                                                    })
-                                                    .ok();
-                                            }
-                                        },
-                                    );
-                                }
-                                if relation_available {
-                                    if can_row_action {
-                                        menu = menu.separator();
-                                    }
-                                    menu = menu.entry("View Relation", None, {
-                                        let relation_view = relation_view.clone();
-                                        move |window, cx| {
-                                            relation_view
-                                                .update(cx, |this, cx| {
-                                                    this.view_relation(
-                                                        row_index,
-                                                        column_index,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                })
-                                                .ok();
-                                        }
-                                    });
-                                }
-                                menu
-                            }))
+                        .w_full()
+                        .when(row.deleted, |this| {
+                            this.bg(cx.theme().status().deleted_background.opacity(0.35))
                         })
-                        .into_any_element()
+                        .when(changed && !row.deleted, |this| {
+                            this.bg(if row.original.is_none() {
+                                cx.theme().status().created_background.opacity(0.35)
+                            } else {
+                                cx.theme().status().warning_background.opacity(0.35)
+                            })
+                        })
+                        .when(can_edit && !row.deleted && !self.is_saving, |this| {
+                            this.cursor_text().on_click(cx.listener(
+                                move |this, event: &ClickEvent, window, cx| {
+                                    if event.click_count() >= 2 {
+                                        this.start_editing(row_index, column_index, window, cx);
+                                    }
+                                },
+                            ))
+                        })
+                        .child(label)
+                        .into_any_element();
+
+                    let relation_available = self
+                        .relation_for_cell(data, row_index, column_index)
+                        .is_some();
+                    let can_row_action = can_edit && !self.is_saving;
+                    let nullable = data
+                        .columns
+                        .get(column_index)
+                        .and_then(|column| data.metadata_column(&column.label))
+                        .is_some_and(|column| column.nullable);
+                    let can_set_null = can_row_action && !row.deleted && nullable;
+                    let deleted = row.deleted;
+                    let this = cx.weak_entity();
+                    right_click_menu((
+                        "database-table-cell-menu",
+                        row_index * data.columns.len() + column_index,
+                    ))
+                    .trigger(move |_, _, _| cell)
+                    .maybe_menu(move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.selected_row = Some(row_index);
+                            cx.notify();
+                        })
+                        .ok();
+                        if !can_row_action && !relation_available {
+                            return None;
+                        }
+
+                        let set_null_view = this.clone();
+                        let delete_view = this.clone();
+                        let relation_view = this.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            if can_set_null {
+                                menu = menu.entry("Set NULL", None, {
+                                    let set_null_view = set_null_view.clone();
+                                    move |_, cx| {
+                                        set_null_view
+                                            .update(cx, |this, cx| {
+                                                this.set_cell_null(row_index, column_index, cx)
+                                            })
+                                            .ok();
+                                    }
+                                });
+                            }
+                            if can_row_action {
+                                menu = menu.entry(
+                                    if deleted { "Restore Row" } else { "Delete Row" },
+                                    None,
+                                    {
+                                        let delete_view = delete_view.clone();
+                                        move |_, cx| {
+                                            delete_view
+                                                .update(cx, |this, cx| {
+                                                    this.toggle_delete(row_index, cx)
+                                                })
+                                                .ok();
+                                        }
+                                    },
+                                );
+                            }
+                            if relation_available {
+                                if can_row_action {
+                                    menu = menu.separator();
+                                }
+                                menu = menu.entry("View Relation", None, {
+                                    let relation_view = relation_view.clone();
+                                    move |window, cx| {
+                                        relation_view
+                                            .update(cx, |this, cx| {
+                                                this.view_relation(
+                                                    row_index,
+                                                    column_index,
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                    }
+                                });
+                            }
+                            menu
+                        }))
                     })
-                    .collect::<Vec<_>>();
+                    .into_any_element()
+                })
+                .collect::<Vec<_>>();
             table = table.row(cells);
         }
 

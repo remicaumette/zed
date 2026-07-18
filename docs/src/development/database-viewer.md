@@ -42,6 +42,7 @@ in a native Zed view with staged row editing.
 - [x] Cycle ascending, descending, and unsorted order by selecting a result column.
 - [x] Display row and column borders so editable cells are clearly delimited.
 - [x] Edit cells inline, add rows, and stage row deletions for tables with a primary key.
+- [x] Pick calendar dates for JDBC date and timestamp cells while preserving timestamp times.
 - [x] Select rows and expose NULL, delete, and foreign-key navigation context actions.
 - [x] Page through table data in bounded 100-row JDBC result windows.
 - [x] Confirm before discarding staged changes during result navigation.
@@ -219,7 +220,8 @@ configured bound.
 - Persistent result tabs and query history across executions.
 - [x] Editable table data with safe primary-key requirements.
 - [x] Staged inserts, updates, and deletions with atomic save and discard.
-- Improve JDBC value editors for binary, temporal, JSON, and database-specific types.
+- [x] Calendar picker for JDBC date and timestamp values.
+- Improve JDBC value editors for binary, JSON, and database-specific types.
 - Add optimistic concurrency checks and a generated SQL preview.
 - DDL preview, data export, and explain plans.
 - Schema diff and richer database-specific object support.
@@ -315,29 +317,33 @@ For metadata and table data:
 9. Select a row and confirm that **Delete Row** becomes available. Double-click a
    cell, edit its value, then select another cell. Confirm that the
    changed cell is highlighted but that the database has not changed yet.
-10. Right-click a cell and select **Set NULL**. Confirm that `NULL` is staged while
+10. Double-click a JDBC `DATE`, `TIMESTAMP`, or `DATETIME` cell, then select the
+    clock button. Choose a day in the calendar and confirm that timestamps keep
+    their existing time and timezone suffix.
+11. Right-click a cell and select **Set NULL**. Confirm that `NULL` is staged while
     typing the text `NULL` directly remains an ordinary string value.
-11. Add a row, enter its values, mark an existing row for deletion using either
+12. Add a row, enter its values, mark an existing row for deletion using either
     **Delete Row** or the context menu, and select
     **Save Changes**. Confirm that all three changes appear after the automatic
     refresh.
-12. Stage another edit and select **Refresh**, change page, select a column header,
+13. Stage another edit and select **Refresh**, change page, select a column header,
     or choose **View Relation**. Confirm that Zed asks whether to discard the
     pending changes before navigating.
-13. Close a table tab with a staged edit. Confirm that Zed offers to save,
+14. Close a table tab with a staged edit. Confirm that Zed offers to save,
     discard, or cancel instead of silently losing the change.
-14. Select **Discard** directly. Confirm that original values return
+15. Select **Discard** directly. Confirm that original values return
     and newly staged rows disappear.
-15. Use **Previous** and **Next** to navigate multiple 100-row pages.
-16. Right-click a non-null foreign-key cell and select **View Relation**. Confirm
+16. Use **Previous** and **Next** to navigate multiple 100-row pages.
+17. Right-click a non-null foreign-key cell and select **View Relation**. Confirm
     that a new table tab opens with the referenced row and a readable `WHERE`.
-17. Open a table without a primary key. Confirm that it remains browsable but the
+18. Open a table without a primary key. Confirm that it remains browsable but the
     editing actions are unavailable and the toolbar explains why.
 
 The first editing slice sends at most 1,000 row mutations per save and relies on
 JDBC conversion from entered text to the reported column type. It intentionally
-requires both a writable connection and a JDBC-reported primary key. Type-aware
-editors and optimistic concurrency checks remain planned. Editing is also
+requires both a writable connection and a JDBC-reported primary key. Temporal
+cells have a calendar picker; richer binary, JSON, and database-specific editors
+and optimistic concurrency checks remain planned. Editing is also
 disabled when the bounded result reader had to truncate a cell, so a shortened
 primary-key value can never identify the wrong row.
 

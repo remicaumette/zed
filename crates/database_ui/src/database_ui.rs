@@ -1,5 +1,6 @@
 mod connection_editor;
 mod console;
+mod date_picker;
 mod results_panel;
 mod table_data;
 
