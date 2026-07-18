@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -27,10 +28,11 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.regex.Pattern;
 
 public final class Main {
-    private static final int PROTOCOL_VERSION = 2;
+    private static final int PROTOCOL_VERSION = 3;
     private static final int MAX_FRAME_SIZE = 16 * 1024 * 1024;
     private static final int MAX_CELL_CHARACTERS = 4096;
     private static final int MAX_RESULT_CHARACTERS = 500_000;
@@ -88,6 +90,11 @@ public final class Main {
                     return ResponseEnvelope.success(request.requestId, describeTable(request));
                 case "browseTable":
                     return ResponseEnvelope.success(request.requestId, browseTable(request));
+                case "applyTableChanges":
+                    return ResponseEnvelope.success(
+                        request.requestId,
+                        applyTableChanges(request)
+                    );
                 default:
                     return ResponseEnvelope.error(
                         request.requestId,
@@ -211,6 +218,7 @@ public final class Main {
                     List.of(),
                     updateCount >= 0 ? Long.valueOf(updateCount) : null,
                     false,
+                    false,
                     Duration.between(startedAt, Instant.now()).toMillis()
                 );
             }
@@ -229,6 +237,7 @@ public final class Main {
 
                 List<List<String>> rows = new ArrayList<>();
                 boolean truncated = false;
+                boolean valuesTruncated = false;
                 int remainingCharacters = MAX_RESULT_CHARACTERS;
                 rowsLoop:
                 while (resultSet.next()) {
@@ -243,10 +252,12 @@ public final class Main {
                         if (value != null && value.length() > MAX_CELL_CHARACTERS) {
                             value = value.substring(0, MAX_CELL_CHARACTERS);
                             truncated = true;
+                            valuesTruncated = true;
                         }
                         if (value != null && value.length() > remainingCharacters) {
                             value = value.substring(0, remainingCharacters);
                             truncated = true;
+                            valuesTruncated = true;
                         }
                         row.add(value);
                         if (value != null) {
@@ -265,6 +276,7 @@ public final class Main {
                     rows,
                     null,
                     truncated,
+                    valuesTruncated,
                     Duration.between(startedAt, Instant.now()).toMillis()
                 );
             }
@@ -388,7 +400,9 @@ public final class Main {
                     columns.add(new MetadataColumn(
                         result.getString("COLUMN_NAME"),
                         result.getString("TYPE_NAME"),
+                        result.getInt("DATA_TYPE"),
                         result.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls,
+                        "YES".equalsIgnoreCase(nullableString(result, "IS_AUTOINCREMENT")),
                         result.getInt("ORDINAL_POSITION"),
                         nullableString(result, "COLUMN_DEF")
                     ));
@@ -434,8 +448,257 @@ public final class Main {
                 ));
             }
             indexes.sort(Comparator.comparing(index -> index.name, String.CASE_INSENSITIVE_ORDER));
-            return new TableMetadataDetails(columns, indexes);
+            return new TableMetadataDetails(columns, indexes, primaryKey(metadata, request));
         }
+    }
+
+    private static List<String> primaryKey(DatabaseMetaData metadata, RequestEnvelope request)
+        throws SQLException {
+        Map<Integer, String> columns = new TreeMap<>();
+        try {
+            try (ResultSet result = metadata.getPrimaryKeys(
+                request.catalog,
+                request.schema,
+                request.table
+            )) {
+                while (result.next()) {
+                    String column = nullableString(result, "COLUMN_NAME");
+                    if (!isBlank(column)) {
+                        columns.put((int) result.getShort("KEY_SEQ"), column);
+                    }
+                }
+            }
+        } catch (SQLException | UnsupportedOperationException ignored) {
+            // Missing primary-key metadata makes the table read-only.
+        }
+        return new ArrayList<>(columns.values());
+    }
+
+    private static TableMutationResult applyTableChanges(RequestEnvelope request)
+        throws SQLException {
+        if (request.connection.readOnly) {
+            throw new IllegalArgumentException("The connection is read-only");
+        }
+        if (request.table == null || request.table.isBlank()) {
+            throw new IllegalArgumentException("A table name is required");
+        }
+        if (request.changes == null) {
+            throw new IllegalArgumentException("Table changes are required");
+        }
+
+        List<TableRowUpdate> updates = valuesOrEmpty(request.changes.updates);
+        List<TableInsert> inserts = valuesOrEmpty(request.changes.inserts);
+        List<TableRowDelete> deletes = valuesOrEmpty(request.changes.deletes);
+        int mutationCount = updates.size() + inserts.size() + deletes.size();
+        if (mutationCount == 0) {
+            throw new IllegalArgumentException("There are no table changes to save");
+        }
+        if (mutationCount > 1000) {
+            throw new IllegalArgumentException("At most 1000 table changes can be saved at once");
+        }
+
+        DriverManager.setLoginTimeout(Math.max(1, request.connection.timeoutSeconds));
+        try (Connection connection = openConnection(request.connection)) {
+            DatabaseMetaData metadata = connection.getMetaData();
+            List<String> primaryKey = primaryKey(metadata, request);
+            if (primaryKey.isEmpty()) {
+                throw new IllegalArgumentException(
+                    "Rows can only be changed when the table has a primary key"
+                );
+            }
+            Map<String, MetadataColumn> columns = tableColumns(metadata, request);
+            String tableName = qualifiedTableName(connection, request);
+            connection.setAutoCommit(false);
+
+            long updated = 0;
+            long inserted = 0;
+            long deleted = 0;
+            try {
+                for (TableRowDelete delete : deletes) {
+                    List<TableMutationCell> key = validateKey(delete.key, primaryKey, columns);
+                    String sql = "DELETE FROM " + tableName + " WHERE "
+                        + predicates(metadata, key);
+                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                        bindCells(statement, 1, key, columns, false);
+                        requireSingleRow(statement.executeUpdate(), "delete");
+                        deleted++;
+                    }
+                }
+
+                for (TableRowUpdate update : updates) {
+                    List<TableMutationCell> values = validateCells(update.values, columns);
+                    if (values.isEmpty()) {
+                        continue;
+                    }
+                    List<TableMutationCell> key = validateKey(update.key, primaryKey, columns);
+                    List<String> assignments = new ArrayList<>();
+                    for (TableMutationCell value : values) {
+                        assignments.add(quoteIdentifier(metadata, value.column) + " = ?");
+                    }
+                    String sql = "UPDATE " + tableName + " SET "
+                        + String.join(", ", assignments) + " WHERE "
+                        + predicates(metadata, key);
+                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                        int parameter = bindCells(statement, 1, values, columns, true);
+                        bindCells(statement, parameter, key, columns, false);
+                        requireSingleRow(statement.executeUpdate(), "update");
+                        updated++;
+                    }
+                }
+
+                for (TableInsert insert : inserts) {
+                    List<TableMutationCell> values = validateCells(insert.values, columns);
+                    String sql;
+                    if (values.isEmpty()) {
+                        sql = "INSERT INTO " + tableName + " DEFAULT VALUES";
+                    } else {
+                        List<String> names = new ArrayList<>();
+                        List<String> placeholders = new ArrayList<>();
+                        for (TableMutationCell value : values) {
+                            names.add(quoteIdentifier(metadata, value.column));
+                            placeholders.add("?");
+                        }
+                        sql = "INSERT INTO " + tableName + " ("
+                            + String.join(", ", names) + ") VALUES ("
+                            + String.join(", ", placeholders) + ")";
+                    }
+                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                        bindCells(statement, 1, values, columns, true);
+                        requireSingleRow(statement.executeUpdate(), "insert");
+                        inserted++;
+                    }
+                }
+
+                connection.commit();
+                return new TableMutationResult(updated, inserted, deleted);
+            } catch (SQLException | RuntimeException error) {
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackError) {
+                    error.addSuppressed(rollbackError);
+                }
+                throw error;
+            }
+        }
+    }
+
+    private static Map<String, MetadataColumn> tableColumns(
+        DatabaseMetaData metadata,
+        RequestEnvelope request
+    ) throws SQLException {
+        Map<String, MetadataColumn> columns = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        try (ResultSet result = metadata.getColumns(
+            request.catalog,
+            request.schema,
+            request.table,
+            "%"
+        )) {
+            while (result.next()) {
+                String name = result.getString("COLUMN_NAME");
+                if (!isBlank(name)) {
+                    columns.put(name, new MetadataColumn(
+                        name,
+                        result.getString("TYPE_NAME"),
+                        result.getInt("DATA_TYPE"),
+                        result.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls,
+                        "YES".equalsIgnoreCase(nullableString(result, "IS_AUTOINCREMENT")),
+                        result.getInt("ORDINAL_POSITION"),
+                        nullableString(result, "COLUMN_DEF")
+                    ));
+                }
+            }
+        }
+        if (columns.isEmpty()) {
+            throw new IllegalArgumentException("The table has no writable columns");
+        }
+        return columns;
+    }
+
+    private static List<TableMutationCell> validateCells(
+        List<TableMutationCell> cells,
+        Map<String, MetadataColumn> columns
+    ) {
+        List<TableMutationCell> result = new ArrayList<>();
+        Set<String> seen = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (TableMutationCell cell : valuesOrEmpty(cells)) {
+            if (cell == null || isBlank(cell.column) || !columns.containsKey(cell.column)) {
+                throw new IllegalArgumentException("A table change references an unknown column");
+            }
+            if (!seen.add(cell.column)) {
+                throw new IllegalArgumentException("A table change references a column twice");
+            }
+            MetadataColumn column = columns.get(cell.column);
+            result.add(new TableMutationCell(column.name, cell.value));
+        }
+        return result;
+    }
+
+    private static List<TableMutationCell> validateKey(
+        List<TableMutationCell> cells,
+        List<String> primaryKey,
+        Map<String, MetadataColumn> columns
+    ) {
+        List<TableMutationCell> validated = validateCells(cells, columns);
+        Map<String, TableMutationCell> byColumn = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (TableMutationCell cell : validated) {
+            byColumn.put(cell.column, cell);
+        }
+        if (byColumn.size() != primaryKey.size()) {
+            throw new IllegalArgumentException("The row key does not match the table primary key");
+        }
+        List<TableMutationCell> ordered = new ArrayList<>();
+        for (String column : primaryKey) {
+            TableMutationCell cell = byColumn.get(column);
+            if (cell == null || cell.value == null) {
+                throw new IllegalArgumentException("A primary key value is missing");
+            }
+            ordered.add(cell);
+        }
+        return ordered;
+    }
+
+    private static String predicates(DatabaseMetaData metadata, List<TableMutationCell> cells)
+        throws SQLException {
+        List<String> predicates = new ArrayList<>();
+        for (TableMutationCell cell : cells) {
+            predicates.add(quoteIdentifier(metadata, cell.column) + " = ?");
+        }
+        return String.join(" AND ", predicates);
+    }
+
+    private static int bindCells(
+        PreparedStatement statement,
+        int parameter,
+        List<TableMutationCell> cells,
+        Map<String, MetadataColumn> columns,
+        boolean allowNull
+    ) throws SQLException {
+        for (TableMutationCell cell : cells) {
+            MetadataColumn column = columns.get(cell.column);
+            if (cell.value == null) {
+                if (!allowNull) {
+                    throw new IllegalArgumentException("A primary key value is missing");
+                }
+                statement.setNull(parameter, column.jdbcType);
+            } else {
+                statement.setObject(parameter, cell.value, column.jdbcType);
+            }
+            parameter++;
+        }
+        return parameter;
+    }
+
+    private static void requireSingleRow(int affectedRows, String operation) throws SQLException {
+        if (affectedRows != 1) {
+            throw new SQLException(
+                "Expected the " + operation + " to affect one row, but it affected "
+                    + affectedRows
+            );
+        }
+    }
+
+    private static <T> List<T> valuesOrEmpty(List<T> values) {
+        return values == null ? List.of() : values;
     }
 
     private static String qualifiedTableName(Connection connection, RequestEnvelope request)
@@ -562,6 +825,7 @@ public final class Main {
         public String table;
         public String whereClause;
         public String orderBy;
+        public TableChanges changes;
     }
 
     public static final class ConnectionRequest {
@@ -638,6 +902,7 @@ public final class Main {
         public final List<List<String>> rows;
         public final Long affectedRows;
         public final boolean truncated;
+        public final boolean valuesTruncated;
         public final long elapsedMillis;
 
         QueryResult(
@@ -645,12 +910,14 @@ public final class Main {
             List<List<String>> rows,
             Long affectedRows,
             boolean truncated,
+            boolean valuesTruncated,
             long elapsedMillis
         ) {
             this.columns = columns;
             this.rows = rows;
             this.affectedRows = affectedRows;
             this.truncated = truncated;
+            this.valuesTruncated = valuesTruncated;
             this.elapsedMillis = elapsedMillis;
         }
     }
@@ -692,20 +959,26 @@ public final class Main {
     public static final class MetadataColumn {
         public final String name;
         public final String typeName;
+        public final int jdbcType;
         public final boolean nullable;
+        public final boolean autoIncrement;
         public final int ordinalPosition;
         public final String defaultValue;
 
         MetadataColumn(
             String name,
             String typeName,
+            int jdbcType,
             boolean nullable,
+            boolean autoIncrement,
             int ordinalPosition,
             String defaultValue
         ) {
             this.name = name;
             this.typeName = typeName;
+            this.jdbcType = jdbcType;
             this.nullable = nullable;
+            this.autoIncrement = autoIncrement;
             this.ordinalPosition = ordinalPosition;
             this.defaultValue = defaultValue;
         }
@@ -726,10 +999,59 @@ public final class Main {
     public static final class TableMetadataDetails {
         public final List<MetadataColumn> columns;
         public final List<MetadataIndex> indexes;
+        public final List<String> primaryKey;
 
-        TableMetadataDetails(List<MetadataColumn> columns, List<MetadataIndex> indexes) {
+        TableMetadataDetails(
+            List<MetadataColumn> columns,
+            List<MetadataIndex> indexes,
+            List<String> primaryKey
+        ) {
             this.columns = columns;
             this.indexes = indexes;
+            this.primaryKey = primaryKey;
+        }
+    }
+
+    public static final class TableMutationCell {
+        public String column;
+        public String value;
+
+        TableMutationCell() {}
+
+        TableMutationCell(String column, String value) {
+            this.column = column;
+            this.value = value;
+        }
+    }
+
+    public static final class TableRowUpdate {
+        public List<TableMutationCell> key;
+        public List<TableMutationCell> values;
+    }
+
+    public static final class TableInsert {
+        public List<TableMutationCell> values;
+    }
+
+    public static final class TableRowDelete {
+        public List<TableMutationCell> key;
+    }
+
+    public static final class TableChanges {
+        public List<TableRowUpdate> updates;
+        public List<TableInsert> inserts;
+        public List<TableRowDelete> deletes;
+    }
+
+    public static final class TableMutationResult {
+        public final long updated;
+        public final long inserted;
+        public final long deleted;
+
+        TableMutationResult(long updated, long inserted, long deleted) {
+            this.updated = updated;
+            this.inserted = inserted;
+            this.deleted = deleted;
         }
     }
 

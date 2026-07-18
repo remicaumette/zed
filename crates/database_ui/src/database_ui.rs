@@ -67,6 +67,7 @@ pub struct DatabasePanel {
     console_registry: ConsoleRegistry,
     console_storage_key: Option<String>,
     expanded_connections: HashSet<ConnectionId>,
+    expanded_console_groups: HashSet<ConnectionId>,
     expanded_database_groups: HashSet<ConnectionId>,
     metadata_states: HashMap<ConnectionId, ConnectionMetadataState>,
     connection_states: HashMap<ConnectionId, ConnectionState>,
@@ -140,6 +141,11 @@ impl DatabasePanel {
             .iter()
             .map(|console| console.connection_id)
             .collect();
+        let expanded_console_groups = console_registry
+            .consoles
+            .iter()
+            .map(|console| console.connection_id)
+            .collect();
 
         let workspace_handle = workspace.clone();
         workspace.update_in(&mut cx, move |_, _, cx| {
@@ -152,6 +158,7 @@ impl DatabasePanel {
                 console_registry,
                 console_storage_key,
                 expanded_connections,
+                expanded_console_groups,
                 expanded_database_groups: HashSet::default(),
                 metadata_states: HashMap::default(),
                 connection_states: HashMap::default(),
@@ -233,6 +240,7 @@ impl DatabasePanel {
         console.sql = format!("-- {}\n\n", profile.name);
         self.console_registry.upsert(console.clone());
         self.expanded_connections.insert(profile.id);
+        self.expanded_console_groups.insert(profile.id);
         self.persist_consoles(cx);
         self.open_console(profile, console, window, cx);
     }
@@ -526,6 +534,13 @@ impl DatabasePanel {
         cx.notify();
     }
 
+    fn toggle_console_group(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if !self.expanded_console_groups.remove(&id) {
+            self.expanded_console_groups.insert(id);
+        }
+        cx.notify();
+    }
+
     fn persist_consoles(&mut self, cx: &mut Context<Self>) {
         let Some(storage_key) = self.console_storage_key.clone() else {
             return;
@@ -568,6 +583,7 @@ impl DatabasePanel {
             .consoles
             .retain(|console| console.connection_id != id);
         self.expanded_connections.remove(&id);
+        self.expanded_console_groups.remove(&id);
         self.expanded_database_groups.remove(&id);
         self.metadata_states.remove(&id);
         self.connection_states.remove(&id);
@@ -675,6 +691,7 @@ impl DatabasePanel {
                 Color::Error,
             )],
             MetadataLoadState::Loaded(details) => {
+                let primary_key = details.primary_key;
                 let mut nodes = vec![self.render_metadata_message(
                     format!("metadata-columns-{connection_id}-{database_index}-{table_index}"),
                     4,
@@ -687,6 +704,9 @@ impl DatabasePanel {
                         .into_iter()
                         .enumerate()
                         .map(|(index, column)| {
+                            let is_primary_key = primary_key
+                                .iter()
+                                .any(|key| key.eq_ignore_ascii_case(&column.name));
                             ListItem::new(format!(
                                 "metadata-column-{connection_id}-{database_index}-{table_index}-{index}"
                             ))
@@ -704,6 +724,13 @@ impl DatabasePanel {
                                             .color(Color::Muted),
                                     )
                                     .child(Label::new(column.name).truncate())
+                                    .when(is_primary_key, |this| {
+                                        this.child(
+                                            Label::new("PK")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Accent),
+                                        )
+                                    })
                                     .child(
                                         Label::new(column.type_name)
                                             .size(LabelSize::Small)
@@ -963,6 +990,95 @@ impl DatabasePanel {
         nodes
     }
 
+    fn render_console_group(
+        &self,
+        profile: ConnectionProfile,
+        consoles: Vec<QueryConsole>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let connection_id = profile.id;
+        let expanded = self.expanded_console_groups.contains(&connection_id);
+        let profile_for_create = profile.clone();
+        let mut group = v_flex().w_full().child(
+            ListItem::new(format!("database-consoles-{connection_id}"))
+                .inset(true)
+                .indent_level(1)
+                .on_click(
+                    cx.listener(move |panel, _, _, cx| {
+                        panel.toggle_console_group(connection_id, cx)
+                    }),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Icon::new(IconName::TerminalAlt)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(div().flex_1().child(Label::new("Consoles")))
+                        .child(
+                            IconButton::new(format!("new-console-{connection_id}"), IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("New query console"))
+                                .on_click(cx.listener(move |panel, _, window, cx| {
+                                    cx.stop_propagation();
+                                    panel.create_console(profile_for_create.clone(), window, cx);
+                                })),
+                        ),
+                ),
+        );
+        if expanded {
+            if consoles.is_empty() {
+                group = group.child(self.render_metadata_message(
+                    format!("database-consoles-empty-{connection_id}"),
+                    2,
+                    "No query consoles",
+                    Color::Muted,
+                ));
+            } else {
+                group = group.children(consoles.into_iter().map(|console| {
+                    let profile = profile.clone();
+                    let console_for_open = console.clone();
+                    ListItem::new(console.id.to_string())
+                        .inset(true)
+                        .indent_level(2)
+                        .on_click(cx.listener(move |panel, _, window, cx| {
+                            panel.open_console(
+                                profile.clone(),
+                                console_for_open.clone(),
+                                window,
+                                cx,
+                            );
+                        }))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::FileDoc)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(console.name).truncate()),
+                        )
+                }));
+            }
+        }
+        group.into_any_element()
+    }
+
     fn render_database_group(
         &self,
         profile: ConnectionProfile,
@@ -1067,6 +1183,7 @@ impl DatabasePanel {
             .filter(|console| console.connection_id == id)
             .cloned()
             .collect::<Vec<_>>();
+        let profile_for_consoles = profile.clone();
         let profile_for_metadata = profile.clone();
         let connection_state = self.connection_states.get(&id).cloned();
         v_flex()
@@ -1118,17 +1235,6 @@ impl DatabasePanel {
                                 ),
                             })
                             .child({
-                                let profile = profile.clone();
-                                IconButton::new(format!("new-console-{id}"), IconName::Plus)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("New query console"))
-                                    .on_click(cx.listener(move |panel, _, window, cx| {
-                                        cx.stop_propagation();
-                                        panel.create_console(profile.clone(), window, cx);
-                                    }))
-                            })
-                            .child({
-                                let profile = profile.clone();
                                 IconButton::new(format!("edit-{id}"), IconName::Pencil)
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Edit connection"))
@@ -1154,33 +1260,8 @@ impl DatabasePanel {
                     ),
             )
             .when(expanded, |this| {
-                this.children(consoles.into_iter().map(|console| {
-                    let profile = profile.clone();
-                    let console_for_open = console.clone();
-                    ListItem::new(console.id.to_string())
-                        .inset(true)
-                        .indent_level(1)
-                        .on_click(cx.listener(move |panel, _, window, cx| {
-                            panel.open_console(
-                                profile.clone(),
-                                console_for_open.clone(),
-                                window,
-                                cx,
-                            );
-                        }))
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .gap_2()
-                                .child(
-                                    Icon::new(IconName::FileDoc)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .child(Label::new(console.name).truncate()),
-                        )
-                }))
-                .child(self.render_database_group(profile_for_metadata, cx))
+                this.child(self.render_console_group(profile_for_consoles, consoles, cx))
+                    .child(self.render_database_group(profile_for_metadata, cx))
             })
     }
 }

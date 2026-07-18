@@ -8,7 +8,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -35,6 +35,7 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Option<String>>>,
     pub affected_rows: Option<u64>,
     pub truncated: bool,
+    pub values_truncated: bool,
     pub elapsed_millis: u64,
 }
 
@@ -61,7 +62,9 @@ pub struct MetadataTable {
 pub struct MetadataColumn {
     pub name: String,
     pub type_name: String,
+    pub jdbc_type: i32,
     pub nullable: bool,
+    pub auto_increment: bool,
     pub ordinal_position: u32,
     pub default_value: Option<String>,
 }
@@ -79,6 +82,49 @@ pub struct MetadataIndex {
 pub struct TableMetadataDetails {
     pub columns: Vec<MetadataColumn>,
     pub indexes: Vec<MetadataIndex>,
+    pub primary_key: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableMutationCell {
+    pub column: String,
+    pub value: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRowUpdate {
+    pub key: Vec<TableMutationCell>,
+    pub values: Vec<TableMutationCell>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableInsert {
+    pub values: Vec<TableMutationCell>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRowDelete {
+    pub key: Vec<TableMutationCell>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableChanges {
+    pub updates: Vec<TableRowUpdate>,
+    pub inserts: Vec<TableInsert>,
+    pub deletes: Vec<TableRowDelete>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableMutationResult {
+    pub updated: u64,
+    pub inserted: u64,
+    pub deleted: u64,
 }
 
 #[derive(Serialize)]
@@ -102,6 +148,8 @@ struct RequestEnvelope<'a> {
     where_clause: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     order_by: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changes: Option<&'a TableChanges>,
 }
 
 #[derive(Serialize)]
@@ -151,6 +199,7 @@ pub async fn test_connection(
             table: None,
             where_clause: None,
             order_by: None,
+            changes: None,
         },
     )
     .await
@@ -184,6 +233,7 @@ pub async fn execute_query(
             table: None,
             where_clause: None,
             order_by: None,
+            changes: None,
         },
     )
     .await
@@ -207,6 +257,7 @@ pub async fn list_databases(
             table: None,
             where_clause: None,
             order_by: None,
+            changes: None,
         },
     )
     .await
@@ -231,6 +282,7 @@ pub async fn list_tables(
             table: None,
             where_clause: None,
             order_by: None,
+            changes: None,
         },
     )
     .await
@@ -255,6 +307,7 @@ pub async fn describe_table(
             table: Some(&table.name),
             where_clause: None,
             order_by: None,
+            changes: None,
         },
     )
     .await
@@ -285,6 +338,36 @@ pub async fn browse_table(
             table: Some(&table.name),
             where_clause: where_clause.filter(|clause| !clause.trim().is_empty()),
             order_by: order_by.filter(|order| !order.trim().is_empty()),
+            changes: None,
+        },
+    )
+    .await
+}
+
+pub async fn apply_table_changes(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+    table: &MetadataTable,
+    changes: &TableChanges,
+) -> Result<TableMutationResult> {
+    if changes.updates.is_empty() && changes.inserts.is_empty() && changes.deletes.is_empty() {
+        bail!("there are no table changes to save");
+    }
+    invoke(
+        profile,
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: "applyTableChanges",
+            connection: connection_request(profile, password),
+            sql: None,
+            max_rows: None,
+            catalog: table.catalog.as_deref(),
+            schema: table.schema.as_deref(),
+            table: Some(&table.name),
+            where_clause: None,
+            order_by: None,
+            changes: Some(changes),
         },
     )
     .await
@@ -457,6 +540,7 @@ mod tests {
             table: None,
             where_clause: None,
             order_by: None,
+            changes: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -499,6 +583,7 @@ mod tests {
         assert_eq!(result.rows, vec![vec![Some("42".into()), None]]);
         assert_eq!(result.affected_rows, None);
         assert!(!result.truncated);
+        assert!(!result.values_truncated);
 
         let result = smol::block_on(execute_query(
             &profile,
@@ -509,6 +594,18 @@ mod tests {
         .unwrap();
         assert_eq!(result.rows.len(), 10);
         assert!(result.truncated);
+        assert!(!result.values_truncated);
+
+        let result = smol::block_on(execute_query(
+            &profile,
+            None,
+            "select printf('%05000d', 1) as large_value",
+            10,
+        ))
+        .unwrap();
+        assert_eq!(result.rows[0][0].as_ref().unwrap().len(), 4096);
+        assert!(result.truncated);
+        assert!(result.values_truncated);
     }
 
     #[test]
@@ -555,6 +652,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["id", "name", "score"]
         );
+        assert_eq!(details.primary_key, vec!["id"]);
         assert!(
             details
                 .indexes
@@ -573,6 +671,88 @@ mod tests {
         .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][1], Some("beta".into()));
+
+        let beta_id = result.rows[0][0].clone().unwrap();
+        let alpha_id = result.rows[1][0].clone().unwrap();
+        let changes = TableChanges {
+            updates: vec![TableRowUpdate {
+                key: vec![TableMutationCell {
+                    column: "id".into(),
+                    value: Some(beta_id),
+                }],
+                values: vec![TableMutationCell {
+                    column: "score".into(),
+                    value: Some("5".into()),
+                }],
+            }],
+            inserts: vec![TableInsert {
+                values: vec![
+                    TableMutationCell {
+                        column: "name".into(),
+                        value: Some("gamma".into()),
+                    },
+                    TableMutationCell {
+                        column: "score".into(),
+                        value: Some("3".into()),
+                    },
+                ],
+            }],
+            deletes: vec![TableRowDelete {
+                key: vec![TableMutationCell {
+                    column: "id".into(),
+                    value: Some(alpha_id),
+                }],
+            }],
+        };
+        let mutation =
+            smol::block_on(apply_table_changes(&profile, None, widgets, &changes)).unwrap();
+        assert_eq!(
+            mutation,
+            TableMutationResult {
+                updated: 1,
+                inserted: 1,
+                deleted: 1,
+            }
+        );
+        let result = smol::block_on(browse_table(
+            &profile,
+            None,
+            widgets,
+            None,
+            Some("name asc"),
+            100,
+        ))
+        .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][1], Some("beta".into()));
+        assert_eq!(result.rows[0][2], Some("5".into()));
+        assert_eq!(result.rows[1][1], Some("gamma".into()));
+
+        smol::block_on(execute_query(
+            &profile,
+            None,
+            "create table logs(message text)",
+            100,
+        ))
+        .unwrap();
+        let tables = smol::block_on(list_tables(&profile, None, &databases[0])).unwrap();
+        let logs = tables.iter().find(|table| table.name == "logs").unwrap();
+        let error = smol::block_on(apply_table_changes(
+            &profile,
+            None,
+            logs,
+            &TableChanges {
+                inserts: vec![TableInsert {
+                    values: vec![TableMutationCell {
+                        column: "message".into(),
+                        value: Some("unsafe".into()),
+                    }],
+                }],
+                ..TableChanges::default()
+            },
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("primary key"));
     }
 
     #[test]

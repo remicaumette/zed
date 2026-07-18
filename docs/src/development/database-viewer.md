@@ -15,10 +15,10 @@ The first supported databases are PostgreSQL, MySQL, ClickHouse, and SQLite.
 
 Last updated: July 18, 2026.
 
-The project now spans milestones 0 through 3. Connection profiles can be edited
+The project now spans milestones 0 through 4. Connection profiles can be edited
 and tested against a real database. Each saved connection can own multiple
 workspace-local SQL consoles, lazily browse JDBC metadata, and open table data
-in a native Zed view.
+in a native Zed view with staged row editing.
 
 - [x] Add versioned connection profile types.
 - [x] Validate JDBC URLs without storing secrets in the profile.
@@ -31,7 +31,7 @@ in a native Zed view.
 - [x] Download missing built-in drivers on demand with SHA-256 verification.
 - [x] Accept a user-provided JAR for custom JDBC connections.
 - [x] Select the database driver inside a single New Connection dialog.
-- [x] Create multiple persistent `.sql` consoles below each saved connection.
+- [x] Create multiple persistent `.sql` consoles in a dedicated Consoles group.
 - [x] Edit a console with Zed's native editor and SQL language support when installed.
 - [x] Parse and execute the selection, the current statement, or the whole document.
 - [x] Display one result tab per executed statement in a dedicated bottom panel.
@@ -39,6 +39,9 @@ in a native Zed view.
 - [x] Lazily list databases, tables, views, columns, and indexes through JDBC metadata.
 - [x] Open a table data tab with optional `WHERE` and `ORDER BY` fragments.
 - [x] Cycle ascending, descending, and unsorted order by selecting a result column.
+- [x] Edit cells inline, add rows, and stage row deletions for tables with a primary key.
+- [x] Save all staged table changes in one transaction using prepared statements.
+- [x] Keep connections and tables without a JDBC-reported primary key read-only.
 - [x] Exercise the complete protocol against a temporary SQLite database.
 - [ ] Run contract tests against PostgreSQL, MySQL, and ClickHouse containers.
 - [ ] Package the sidecar as part of release builds.
@@ -67,13 +70,19 @@ of Cargo's dependency graph. The sidecar itself contains no database-specific
 driver: Zed adds the selected JAR to the Java classpath and `DriverManager`
 discovers it from the JDBC URL.
 
-Protocol version 2 uses length-prefixed JSON envelopes. Each request has an ID
+Protocol version 3 uses length-prefixed JSON envelopes. Each request has an ID
 and an explicit protocol version. Standard output is reserved for protocol
 frames; diagnostics go to standard error. An incompatible version is rejected
 with an actionable error. The initial query operation returns at most 200 rows,
 truncates oversized cell/result text, and caps protocol frames at 16 MiB.
 Deadlines beyond JDBC's optional timeout, cancellation, result streaming, and a
 persistent sidecar process are still planned.
+
+Table writes are staged in the Rust UI and sent as a single mutation request.
+The sidecar independently verifies that the connection is writable, discovers
+the table and primary key through JDBC metadata, validates every identifier,
+and executes parameterized `INSERT`, `UPDATE`, and `DELETE` statements in one
+transaction. A failed statement rolls the complete change set back.
 
 ### Crate boundaries
 
@@ -199,7 +208,10 @@ configured bound.
 ### Milestone 4: DataGrip-style workflows
 
 - Persistent result tabs and query history across executions.
-- Editable table data with safe primary-key requirements.
+- [x] Editable table data with safe primary-key requirements.
+- [x] Staged inserts, updates, and deletions with atomic save and discard.
+- Improve JDBC value editors for binary, temporal, JSON, and database-specific types.
+- Add optimistic concurrency checks and a generated SQL preview.
 - DDL preview, data export, and explain plans.
 - Schema diff and richer database-specific object support.
 
@@ -251,8 +263,8 @@ For the current connection-editor, SQL console, and JDBC slice:
 7. Keep the generated JDBC URL, or point it at a disposable file.
 8. Change the name and read-only setting, then select **Test Connection**.
 9. Confirm that the success message contains SQLite and JDBC driver versions.
-10. Save the connection, expand it, then select its **+** icon to create
-    `console.sql` as a child item.
+10. Save the connection, expand it, then expand **Consoles** and select its **+**
+    icon to create `console.sql` as a child item.
 11. Enter the following document in the native SQL editor:
 
     ```sql
@@ -266,8 +278,8 @@ For the current connection-editor, SQL console, and JDBC slice:
 13. Select the first two statements and run **Run Selection / Current** again.
     Confirm that the bottom panel contains **Result 1** and **Result 2**.
 14. Select **Run All** and confirm that all three result tabs are available.
-15. Create `console-2.sql` with the connection's **+** icon and confirm both
-    consoles appear as children of the same connection.
+15. Create `console-2.sql` with the **Consoles** group's **+** icon and confirm
+    both consoles appear in the group.
 16. Close and reopen Zed with the same workspace. Confirm that the connection,
     both console names, and their SQL contents remain.
 17. Edit the saved profile, enter a password if the target database needs one,
@@ -289,6 +301,24 @@ For metadata and table data:
 6. Enter `created_at desc` in **ORDER BY**, then select **Apply**.
 7. Select a column header three times. Confirm that **ORDER BY** changes to
    ascending, then descending, then empty, and that data reloads after each click.
+8. Edit the connection and disable **Read-only**, then open a table with a primary
+   key. Confirm that **Add Row**, **Discard**, and **Save Changes** are available.
+9. Double-click a cell, edit its value, then select another cell. Confirm that the
+   changed cell is highlighted but that the database has not changed yet.
+10. Add a row, enter its values, mark an existing row for deletion, and select
+    **Save Changes**. Confirm that all three changes appear after the automatic
+    refresh. Enter the exact value `NULL` to write an SQL null.
+11. Stage another edit and select **Discard**. Confirm that original values return
+    and newly staged rows disappear.
+12. Open a table without a primary key. Confirm that it remains browsable but the
+    editing actions are unavailable and the toolbar explains why.
+
+The first editing slice sends at most 1,000 row mutations per save and relies on
+JDBC conversion from entered text to the reported column type. It intentionally
+requires both a writable connection and a JDBC-reported primary key. Type-aware
+editors and optimistic concurrency checks remain planned. Editing is also
+disabled when the bounded result reader had to truncate a cell, so a shortened
+primary-key value can never identify the wrong row.
 
 Also create a **Custom JDBC** connection, select a local driver JAR with
 **Browse**, and confirm that Zed uses it without copying or downloading it.
