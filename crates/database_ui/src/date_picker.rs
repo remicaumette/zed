@@ -1,5 +1,3 @@
-use std::{cell::Cell, rc::Rc};
-
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window, px,
@@ -166,7 +164,6 @@ pub(crate) struct DatePicker {
     kind: TemporalCellKind,
     time_input: Option<Entity<InputField>>,
     validation_error: Option<String>,
-    open: Rc<Cell<bool>>,
     select_value: SelectValue,
 }
 
@@ -175,7 +172,6 @@ impl DatePicker {
         selected: NaiveDate,
         kind: TemporalCellKind,
         time: Option<String>,
-        open: Rc<Cell<bool>>,
         select_value: SelectValue,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -195,7 +191,6 @@ impl DatePicker {
             kind,
             time_input,
             validation_error: None,
-            open,
             select_value,
         }
     }
@@ -255,12 +250,6 @@ impl DatePicker {
             MONTHS[self.displayed_month as usize - 1],
             self.displayed_year
         )
-    }
-}
-
-impl Drop for DatePicker {
-    fn drop(&mut self) {
-        self.open.set(false);
     }
 }
 
@@ -391,6 +380,8 @@ impl Render for DatePicker {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
     use gpui::TestAppContext;
 
@@ -466,7 +457,6 @@ mod tests {
         let cx = cx.add_empty_window();
         let applied = Rc::new(Cell::new(false));
         let applied_for_picker = applied.clone();
-        let open = Rc::new(Cell::new(true));
         let initial = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
         let selected = NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
         let picker = cx.update(|window, cx| {
@@ -475,7 +465,6 @@ mod tests {
                     initial,
                     TemporalCellKind::Date,
                     None,
-                    open,
                     Box::new(move |_, _, _, _| applied_for_picker.set(true)),
                     window,
                     cx,

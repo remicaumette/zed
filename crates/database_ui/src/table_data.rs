@@ -1,4 +1,4 @@
-use std::{cell::Cell, collections::HashSet, rc::Rc};
+use std::{cell::Cell, collections::HashSet, path::Path, rc::Rc};
 
 use anyhow::{Context as _, Result, anyhow};
 use chrono::Local;
@@ -7,14 +7,16 @@ use database::{
     QueryColumn, QueryResult, TableChanges, TableInsert, TableMetadataDetails, TableMutationCell,
     TableRowDelete, TableRowUpdate, apply_table_changes, browse_table, describe_table,
 };
+use editor::Editor;
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
     PromptLevel, Render, Subscription, Task, WeakEntity, Window, px,
 };
 use project::Project;
 use ui::{
-    Banner, Button, ButtonStyle, Color, ContextMenu, Icon, IconButton, IconButtonShape, IconName,
-    Label, LabelSize, PopoverMenu, Severity, Table, prelude::*, right_click_menu,
+    Banner, Button, ButtonStyle, Color, ColumnWidthConfig, ContextMenu, Icon, IconButton,
+    IconButtonShape, IconName, Label, LabelSize, PopoverMenu, ResizableColumnsState, Severity,
+    Table, TableInteractionState, TableResizeBehavior, prelude::*, right_click_menu,
 };
 use ui_input::{ErasedEditorEvent, InputField};
 use workspace::{
@@ -116,9 +118,7 @@ struct ActiveCellEditor {
     input: Entity<InputField>,
     original: Option<String>,
     edited: Rc<Cell<bool>>,
-    date_picker_open: Rc<Cell<bool>>,
     _input_subscription: Subscription,
-    _focus_out_subscription: Subscription,
 }
 
 #[derive(Clone)]
@@ -146,6 +146,8 @@ pub(crate) struct TableDataView {
     workspace: WeakEntity<Workspace>,
     where_clause: Entity<InputField>,
     order_by: Entity<InputField>,
+    table_interaction_state: Entity<TableInteractionState>,
+    column_widths: Option<Entity<ResizableColumnsState>>,
     sort: Option<(String, SortDirection)>,
     relation_filters: Vec<TableMutationCell>,
     relation_where_display: Option<String>,
@@ -156,6 +158,7 @@ pub(crate) struct TableDataView {
     is_saving: bool,
     save_error: Option<String>,
     task: Option<Task<()>>,
+    _language_tasks: Vec<Task<()>>,
 }
 
 impl TableDataView {
@@ -176,12 +179,46 @@ impl TableDataView {
                 .label("ORDER BY")
                 .tab_index(1)
         });
+        let language_tasks = workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().clone())
+            .map(|project| {
+                let language_registry = project.read(cx).languages().clone();
+                [where_clause.clone(), order_by.clone()]
+                    .into_iter()
+                    .filter_map(|input| {
+                        let editor = input
+                            .read(cx)
+                            .editor()
+                            .as_any()
+                            .downcast_ref::<Entity<Editor>>()?
+                            .clone();
+                        let buffer = editor.read(cx).active_buffer(cx)?;
+                        buffer.update(cx, |buffer, _| {
+                            buffer.set_language_registry(language_registry.clone())
+                        });
+                        let language_registry = language_registry.clone();
+                        Some(cx.spawn(async move |_, cx| {
+                            let Ok(language) = language_registry
+                                .load_language_for_file_path(Path::new("filter.sql"))
+                                .await
+                            else {
+                                return;
+                            };
+                            buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             profile,
             table,
             workspace,
             where_clause,
             order_by,
+            table_interaction_state: cx.new(|cx| TableInteractionState::new(cx)),
+            column_widths: None,
             sort: None,
             relation_filters: Vec::new(),
             relation_where_display: None,
@@ -192,6 +229,7 @@ impl TableDataView {
             is_saving: false,
             save_error: None,
             task: None,
+            _language_tasks: language_tasks,
         }
     }
 
@@ -227,6 +265,22 @@ impl TableDataView {
                 TableDataState::Loaded(data)
                     if !data.details.primary_key.is_empty() && !data.values_truncated
             )
+    }
+
+    fn ensure_column_widths(&mut self, column_count: usize, cx: &mut Context<Self>) {
+        let widths_match = self
+            .column_widths
+            .as_ref()
+            .is_some_and(|widths| widths.read(cx).cols() == column_count);
+        if !widths_match {
+            self.column_widths = Some(cx.new(|_| {
+                ResizableColumnsState::new(
+                    column_count,
+                    vec![px(180.); column_count],
+                    vec![TableResizeBehavior::MinSize(5.); column_count],
+                )
+            }));
+        }
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -348,6 +402,7 @@ impl TableDataView {
             this.update(cx, |this, cx| {
                 this.state = match result {
                     Ok((result, details)) => {
+                        this.ensure_column_widths(result.columns.len(), cx);
                         TableDataState::Loaded(LoadedTableData::new(result, details))
                     }
                     Err(error) => TableDataState::Error(error.to_string()),
@@ -435,39 +490,13 @@ impl TableDataView {
             cx,
         );
         let focus_handle = input.focus_handle(cx);
-        let date_picker_open = Rc::new(Cell::new(false));
-        let date_picker_open_for_focus = date_picker_open.clone();
-        let view_for_focus = cx.weak_entity();
-        let focus_out_subscription =
-            cx.on_focus_out(&focus_handle, window, move |_, _, window, _cx| {
-                let date_picker_open = date_picker_open_for_focus.clone();
-                let view = view_for_focus.clone();
-                window.on_next_frame(move |window, _| {
-                    window.on_next_frame(move |_, cx| {
-                        if !date_picker_open.get() {
-                            view.update(cx, |this, cx| {
-                                let same_cell = this.editing_cell.as_ref().is_some_and(|editor| {
-                                    editor.row == row && editor.column == column
-                                });
-                                if same_cell {
-                                    this.commit_active_edit(cx);
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        }
-                    });
-                });
-            });
         self.editing_cell = Some(ActiveCellEditor {
             row,
             column,
             input,
             original: value,
             edited,
-            date_picker_open,
             _input_subscription: input_subscription,
-            _focus_out_subscription: focus_out_subscription,
         });
         window.focus(&focus_handle, cx);
         cx.notify();
@@ -876,6 +905,11 @@ impl TableDataView {
         }
 
         let can_edit = self.can_edit();
+        self.ensure_column_widths(data.columns.len(), cx);
+        let column_widths = self
+            .column_widths
+            .clone()
+            .expect("table column widths were initialized");
         let headers = data
             .columns
             .iter()
@@ -919,9 +953,11 @@ impl TableDataView {
             .collect::<Vec<_>>();
         let table_column_count = data.columns.len();
         let mut table = Table::new(table_column_count)
-            .width(px((table_column_count.max(1) * 180) as f32))
+            .interactable(&self.table_interaction_state)
+            .width_config(ColumnWidthConfig::Resizable(column_widths))
             .header(headers)
-            .column_borders();
+            .column_borders()
+            .disable_base_style();
         for (row_index, row) in data.rows.iter().enumerate() {
             let cells = row
                 .values
@@ -948,7 +984,7 @@ impl TableDataView {
                                 "table-data-editor",
                                 row_index * data.columns.len() + column_index,
                             ))
-                            .w_full()
+                            .size_full()
                             .min_w_0()
                             .child(div().min_w_0().flex_1().child(editor.input.clone()));
 
@@ -959,9 +995,6 @@ impl TableDataView {
                             };
                             let input_for_picker = editor.input.clone();
                             let edited = editor.edited.clone();
-                            let date_picker_open = editor.date_picker_open.clone();
-                            let date_picker_open_for_menu = date_picker_open.clone();
-                            let date_picker_open_for_open = date_picker_open;
                             let view = cx.weak_entity();
                             editor_element = editor_element.child(
                                 PopoverMenu::new((
@@ -980,7 +1013,6 @@ impl TableDataView {
                                     .aria_label(picker_label),
                                 )
                                 .anchor(gpui::Anchor::TopRight)
-                                .on_open(Rc::new(move |_, _| date_picker_open_for_open.set(true)))
                                 .menu(move |window, cx| {
                                     let current_value = input_for_picker.read(cx).text(cx);
                                     let selected = date_from_value(&current_value)
@@ -989,13 +1021,11 @@ impl TableDataView {
                                     let input = input_for_picker.clone();
                                     let edited = edited.clone();
                                     let view = view.clone();
-                                    let date_picker_open = date_picker_open_for_menu.clone();
                                     Some(cx.new(|cx| {
                                         DatePicker::new(
                                             selected,
                                             temporal_kind,
                                             time,
-                                            date_picker_open,
                                             Box::new(move |date, time, window, cx| {
                                                 let current_value = input.read(cx).text(cx);
                                                 let value = temporal_kind.value_from_picker(
@@ -1052,7 +1082,7 @@ impl TableDataView {
                             "table-data-cell",
                             row_index * data.columns.len() + column_index,
                         ))
-                        .w_full()
+                        .size_full()
                         .when(row.deleted, |this| {
                             this.bg(cx.theme().status().deleted_background.opacity(0.35))
                         })
@@ -1068,11 +1098,14 @@ impl TableDataView {
                                 move |this, event: &ClickEvent, window, cx| {
                                     if event.click_count() >= 2 {
                                         this.start_editing(row_index, column_index, window, cx);
+                                    } else if this.editing_cell.is_some() {
+                                        this.commit_active_edit(cx);
+                                        cx.notify();
                                     }
                                 },
                             ))
                         })
-                        .child(label)
+                        .child(div().size_full().px_1().child(label))
                         .into_any_element();
 
                     let relation_available = self
@@ -1401,20 +1434,7 @@ impl Render for TableDataView {
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .child(div().min_w_0().flex_1().child(self.where_clause.clone()))
-                    .child(div().min_w_0().flex_1().child(self.order_by.clone()))
-                    .child(
-                        Button::new("refresh-database-table-data", "Refresh")
-                            .style(ButtonStyle::Outlined)
-                            .start_icon(Icon::new(IconName::RefreshTitle))
-                            .disabled(self.is_saving)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.request_navigation(
-                                    TableNavigation::Reload { page: this.page },
-                                    window,
-                                    cx,
-                                )
-                            })),
-                    ),
+                    .child(div().min_w_0().flex_1().child(self.order_by.clone())),
             )
             .child(
                 h_flex()
@@ -1433,6 +1453,19 @@ impl Render for TableDataView {
                         )
                     })
                     .child(div().flex_1())
+                    .child(
+                        Button::new("refresh-database-table-data", "Refresh")
+                            .style(ButtonStyle::Outlined)
+                            .start_icon(Icon::new(IconName::RefreshTitle))
+                            .disabled(self.is_saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.request_navigation(
+                                    TableNavigation::Reload { page: this.page },
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
                     .child(
                         Button::new(
                             "delete-selected-database-table-row",

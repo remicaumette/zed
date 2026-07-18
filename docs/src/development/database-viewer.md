@@ -39,8 +39,10 @@ in a native Zed view with staged row editing.
 - [x] Lazily list databases, tables, views, columns, and indexes through JDBC metadata.
 - [x] Open a table data tab with optional `WHERE` and `ORDER BY` fragments.
 - [x] Submit `WHERE` and `ORDER BY` with Enter and refresh explicitly.
+- [x] Highlight SQL syntax in the table `WHERE` and `ORDER BY` editors.
 - [x] Cycle ascending, descending, and unsorted order by selecting a result column.
 - [x] Display row and column borders so editable cells are clearly delimited.
+- [x] Resize table-data columns independently from their header separators.
 - [x] Edit cells inline, add rows, and stage row deletions for tables with a primary key.
 - [x] Pick dates for JDBC date cells and date/time values for timestamp cells.
 - [x] Select rows and expose NULL, delete, and foreign-key navigation context actions.
@@ -307,29 +309,35 @@ For metadata and table data:
 3. Select the chevron beside a table and confirm that **Columns** and **Indexes**
    appear below it, including types, nullability, indexed columns, and uniqueness.
 4. Select the table row itself and confirm that a central data tab opens with at
-   most 100 rows per page.
-5. Enter an expression such as `score >= 10` in **WHERE**, then press Enter.
-6. Enter `created_at desc` in **ORDER BY**, then press Enter.
+   most 100 rows per page. Drag a column-header separator and confirm that the
+   column resizes independently.
+5. Enter an expression such as `score >= 10` in **WHERE**, confirm that SQL
+   tokens are highlighted, then press Enter.
+6. Enter `created_at desc` in **ORDER BY**, confirm that SQL tokens are
+   highlighted, then press Enter.
 7. Select a column header three times. Confirm that **ORDER BY** changes to
    ascending, then descending, then empty, and that data reloads after each click.
 8. Edit the connection and disable **Read-only**, then open a table with a primary
    key. Confirm that **Add Row**, **Discard**, and **Save Changes** are available.
 9. Select a row and confirm that **Delete Row** becomes available. Double-click a
-   cell, edit its value, then select another cell. Confirm that the
-   changed cell is highlighted but that the database has not changed yet.
+   cell, edit its value, then select another cell. Confirm that the yellow
+   changed-cell background fills the cell up to its grid borders but that the
+   database has not changed yet.
 10. Double-click a JDBC `DATE`, `TIMESTAMP`, or `DATETIME` cell, then select the
     clock button. Confirm that the cell editor remains open, choosing a day does
     not close the popover, and only **Apply** stages the value. Timestamp pickers
-    also expose a `TIME` field and preserve fractions of a second and timezones.
+    also expose a `TIME` field that remains editable and preserve fractions of a
+    second and timezones.
 11. Right-click a cell and select **Set NULL**. Confirm that `NULL` is staged while
     typing the text `NULL` directly remains an ordinary string value.
 12. Add a row, enter its values, mark an existing row for deletion using either
     **Delete Row** or the context menu, and select
     **Save Changes**. Confirm that all three changes appear after the automatic
     refresh.
-13. Stage another edit and select **Refresh**, change page, select a column header,
-    or choose **View Relation**. Confirm that Zed asks whether to discard the
-    pending changes before navigating.
+13. Confirm that **Refresh** is on the same action row as **Save Changes**. Stage
+    another edit and select **Refresh**, change page, select a column header, or
+    choose **View Relation**. Confirm that Zed asks whether to discard the pending
+    changes before navigating.
 14. Close a table tab with a staged edit. Confirm that Zed offers to save,
     discard, or cancel instead of silently losing the change.
 15. Select **Discard** directly. Confirm that original values return
