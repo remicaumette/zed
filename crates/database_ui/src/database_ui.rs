@@ -306,6 +306,7 @@ impl Render for DatabasePanel {
                 h_flex()
                     .min_h(px(34.))
                     .flex_none()
+                    .flex_wrap()
                     .gap_1()
                     .px_2()
                     .border_b_1()
@@ -313,7 +314,8 @@ impl Render for DatabasePanel {
                     .child(self.render_add_button(DatabaseDriver::PostgreSql, cx))
                     .child(self.render_add_button(DatabaseDriver::MySql, cx))
                     .child(self.render_add_button(DatabaseDriver::ClickHouse, cx))
-                    .child(self.render_add_button(DatabaseDriver::Sqlite, cx)),
+                    .child(self.render_add_button(DatabaseDriver::Sqlite, cx))
+                    .child(self.render_add_button(DatabaseDriver::Custom, cx)),
             )
             .child(if connections.is_empty() {
                 self.render_empty_state(cx).into_any_element()

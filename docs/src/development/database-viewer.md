@@ -22,10 +22,12 @@ tested against a real database through the JDBC sidecar.
 - [x] Validate JDBC URLs without storing secrets in the profile.
 - [x] Register a native Database panel in Zed's dock.
 - [x] List, create, edit, remove, and persist connection profiles.
-- [x] Configure JDBC URL, username, password, environment, and read-only mode.
+- [x] Configure JDBC URL, username, password, and read-only mode.
 - [x] Store passwords through Zed's credential provider instead of profile data.
 - [x] Start the JDBC sidecar and validate its protocol version.
 - [x] Test a real connection from the editor and display driver metadata.
+- [x] Download missing built-in drivers on demand with SHA-256 verification.
+- [x] Accept a user-provided JAR for custom JDBC connections.
 - [x] Exercise the complete protocol against a temporary SQLite database.
 - [ ] Run contract tests against PostgreSQL, MySQL, and ClickHouse containers.
 - [ ] Package the sidecar as part of release builds.
@@ -39,6 +41,8 @@ Database panel and query views (Rust/GPUI)
                 |
 Connection and metadata services (Rust)
                 |
+Managed or custom JDBC driver JAR
+                |
 Framed, versioned protocol over stdin/stdout
                 |
 JDBC sidecar (Java)
@@ -48,7 +52,9 @@ PostgreSQL | MySQL | ClickHouse | SQLite JDBC drivers
 
 Running JDBC out of process keeps the JVM out of Zed's address space. A driver
 or JVM crash cannot corrupt the editor process, and Java dependencies stay out
-of Cargo's dependency graph.
+of Cargo's dependency graph. The sidecar itself contains no database-specific
+driver: Zed adds the selected JAR to the Java classpath and `DriverManager`
+discovers it from the JDBC URL.
 
 Protocol version 1 uses length-prefixed JSON envelopes. Each request has an ID
 and an explicit protocol version. Standard output is reserved for protocol
@@ -62,9 +68,10 @@ process are still planned before query execution is added.
   service interfaces. It does not depend on GPUI or Java.
 - `database_ui` owns the dock panel, connection editor, object tree, query
   views, and presentation state.
-- The Java module owns JDBC driver loading and connection tests. It will also
-  own connection pools, metadata adapters, statement execution, and result
-  streaming.
+- The Rust driver manager owns verified downloads, installed-driver state, and
+  custom JAR paths.
+- The Java module owns generic JDBC connection tests. It will also own
+  connection pools, statement execution, and result streaming.
 - Zed's main crate only initializes the subsystem and adds its panel.
 
 Zed already has a virtualized table component with dynamic, resizable, and
@@ -74,8 +81,8 @@ a second data grid.
 ## Connection model
 
 A saved profile contains a stable ID, display name, JDBC URL, username, scope,
-environment label, and read-only preference. Passwords and access tokens are
-never serialized with the profile.
+and read-only preference. Passwords and access tokens are never serialized with
+the profile.
 
 Credentials use Zed's credential provider. They are sent to the sidecar only
 when opening a connection and are never returned in errors or logs. Development
@@ -83,17 +90,25 @@ builds use Zed's development credential store by default; set
 `ZED_DEVELOPMENT_USE_KEYCHAIN=1` before launching Zed to exercise the operating
 system keychain.
 
-Connections default to read-only. Production profiles will receive a visible
-warning treatment before any write-capable mode is enabled.
+Connections default to read-only. The JDBC flag is applied during connection
+tests and the future query runner will enforce the same policy before executing
+statements.
 
 ## Driver strategy
 
-| Database   | JDBC driver                                                                             | Pinned version | First metadata adapter |
-| ---------- | --------------------------------------------------------------------------------------- | -------------- | ---------------------- |
-| PostgreSQL | [PostgreSQL JDBC](https://central.sonatype.com/artifact/org.postgresql/postgresql)      | 42.7.11        | PostgreSQL             |
-| MySQL      | [MySQL Connector/J](https://central.sonatype.com/artifact/com.mysql/mysql-connector-j)  | 9.7.0          | MySQL                  |
-| ClickHouse | [ClickHouse JDBC](https://central.sonatype.com/artifact/com.clickhouse/clickhouse-jdbc) | 0.9.8          | ClickHouse             |
-| SQLite     | [Xerial SQLite JDBC](https://central.sonatype.com/artifact/org.xerial/sqlite-jdbc)      | 3.53.2.0       | SQLite                 |
+| Choice      | JDBC driver                                                                             | Version / source | First metadata adapter |
+| ----------- | --------------------------------------------------------------------------------------- | ---------------- | ---------------------- |
+| PostgreSQL  | [PostgreSQL JDBC](https://central.sonatype.com/artifact/org.postgresql/postgresql)      | 42.7.11          | PostgreSQL             |
+| MySQL       | [MySQL Connector/J](https://central.sonatype.com/artifact/com.mysql/mysql-connector-j)  | 9.7.0            | MySQL                  |
+| ClickHouse  | [ClickHouse JDBC](https://central.sonatype.com/artifact/com.clickhouse/clickhouse-jdbc) | 0.9.8 `all` JAR  | ClickHouse             |
+| SQLite      | [Xerial SQLite JDBC](https://central.sonatype.com/artifact/org.xerial/sqlite-jdbc)      | 3.53.2.0         | SQLite                 |
+| Custom JDBC | User-provided JAR                                                                       | User-managed     | Generic JDBC           |
+
+The four predefined drivers are not shipped inside the sidecar. The connection
+editor shows whether the selected version is installed and offers a download
+when it is missing. Downloads come from Maven Central and are accepted only
+when their SHA-256 digest matches the pinned value. A custom JDBC connection
+instead stores the selected local JAR path in its non-secret profile.
 
 `DatabaseMetaData` supplies the common baseline. Small dialect adapters will
 fill gaps and normalize database-specific behavior. This preserves JDBC's
@@ -121,7 +136,7 @@ installations.
 - Native dock panel and actions.
 - Versioned persistence for non-secret profile settings.
 - Connection creation, editing, duplication, and removal.
-- Environment labels and read-only defaults.
+- Clearly labelled read-only mode, enabled by default.
 
 Exit condition: profiles for all four drivers survive a Zed restart and can be
 edited without touching a configuration file.
@@ -130,7 +145,7 @@ edited without touching a configuration file.
 
 - Reproducible sidecar build and packaging.
 - Java runtime discovery with clear setup errors.
-- Driver allowlist and deterministic driver versions.
+- Deterministic managed driver versions and custom JAR support.
 - Handshake, health check, timeouts, cancellation, and crash recovery.
 - Test Connection action with sanitized diagnostics.
 
@@ -180,6 +195,7 @@ Run the smallest relevant checks during development:
 ```sh
 cargo test -p database
 cargo test -p database sidecar::tests::connects_to_sqlite_end_to_end -- --ignored --exact
+cargo test -p database sidecar::tests::resolves_all_managed_jdbc_drivers -- --ignored --exact
 cargo check -p database_ui
 cargo check -p zed
 ```
@@ -203,16 +219,19 @@ For the current connection-editor and JDBC slice:
 1. Run `script/build-database-sidecar`.
 2. Build and launch the development version of Zed.
 3. Open the Database panel using its database icon in the right dock.
-4. Select SQLite and keep the generated JDBC URL, or point it at a disposable
-   file.
-5. Change the name, environment, and read-only setting, then select **Test
-   Connection**.
-6. Confirm that the success message contains SQLite and JDBC driver versions.
-7. Save the connection, close and reopen Zed, and confirm the profile remains.
-8. Edit the saved profile, enter a password if the target database needs one,
-   save it, then reopen the editor. The password field must remain visually
-   empty while **Test Connection** continues to use the stored secret.
-9. Remove the profile, restart Zed, and confirm it stays removed.
+4. Select SQLite and confirm that the editor reports the driver as missing.
+5. Select **Download Driver** and wait for the installed confirmation.
+6. Keep the generated JDBC URL, or point it at a disposable file.
+7. Change the name and read-only setting, then select **Test Connection**.
+8. Confirm that the success message contains SQLite and JDBC driver versions.
+9. Save the connection, close and reopen Zed, and confirm the profile remains.
+10. Edit the saved profile, enter a password if the target database needs one,
+    save it, then reopen the editor. The password field must remain visually
+    empty while **Test Connection** continues to use the stored secret.
+11. Remove the profile, restart Zed, and confirm it stays removed.
+
+Also create a **Custom JDBC** connection, select a local driver JAR with
+**Browse**, and confirm that Zed uses it without copying or downloading it.
 
 Then repeat the test with available PostgreSQL, MySQL, and ClickHouse instances.
 Use driver-specific JDBC URLs such as:
@@ -251,3 +270,10 @@ Avoid scattering driver-specific conditions throughout the UI.
 Persist non-secret settings through Zed's storage. Persist secrets only through
 the credential provider. Redact connection strings and driver errors before
 showing or logging them.
+
+### ADR-005: drivers are classpath resources
+
+Keep the Java sidecar database-agnostic. Predefined drivers are downloaded and
+verified independently, while custom connections reference a local JAR. Start
+Java with the sidecar and selected driver on its classpath, then let JDBC
+`DriverManager` select the implementation from the connection URL.

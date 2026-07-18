@@ -4922,10 +4922,14 @@ name = "database"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-fs",
  "async-process",
  "futures 0.3.32",
+ "http_client",
+ "paths",
  "serde",
  "serde_json",
+ "sha2",
  "smol",
  "tempfile",
  "thiserror 2.0.17",

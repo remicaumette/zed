@@ -12,10 +12,8 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.sql.SQLFeatureNotSupportedException;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Map;
 import java.util.Properties;
 import java.util.regex.Pattern;
 
@@ -27,13 +25,6 @@ public final class Main {
     );
     private static final ObjectMapper JSON = new ObjectMapper()
         .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, true);
-    private static final Map<String, String> DRIVER_CLASSES = Map.of(
-        "postgresql", "org.postgresql.Driver",
-        "mysql", "com.mysql.cj.jdbc.Driver",
-        "click_house", "com.clickhouse.jdbc.ClickHouseDriver",
-        "sqlite", "org.sqlite.JDBC"
-    );
-
     private Main() {}
 
     public static void main(String[] args) throws Exception {
@@ -81,13 +72,6 @@ public final class Main {
                 sanitize(error.getMessage()),
                 error.getSQLState()
             );
-        } catch (ReflectiveOperationException error) {
-            return ResponseEnvelope.error(
-                request.requestId,
-                "driver_unavailable",
-                sanitize(error.getMessage()),
-                null
-            );
         } catch (RuntimeException error) {
             return ResponseEnvelope.error(
                 request.requestId,
@@ -99,13 +83,7 @@ public final class Main {
     }
 
     private static ConnectionTestResult testConnection(ConnectionRequest request)
-        throws SQLException, ReflectiveOperationException {
-        String driverClass = DRIVER_CLASSES.get(request.driver);
-        if (driverClass == null) {
-            throw new IllegalArgumentException("Unsupported JDBC driver");
-        }
-        Class.forName(driverClass);
-
+        throws SQLException {
         Properties properties = new Properties();
         if (request.username != null && !request.username.isBlank()) {
             properties.setProperty("user", request.username);
@@ -117,12 +95,10 @@ public final class Main {
         DriverManager.setLoginTimeout(Math.max(1, request.timeoutSeconds));
         Instant startedAt = Instant.now();
         try (Connection connection = DriverManager.getConnection(request.jdbcUrl, properties)) {
-            if (!"sqlite".equals(request.driver)) {
-                try {
-                    connection.setReadOnly(request.readOnly);
-                } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {
-                    // Read-only is also enforced by the query executor. This flag is best effort.
-                }
+            try {
+                connection.setReadOnly(request.readOnly);
+            } catch (SQLException | UnsupportedOperationException ignored) {
+                // Read-only is also enforced by the query executor. This flag is best effort.
             }
 
             if (!connection.isValid(Math.max(1, request.timeoutSeconds))) {
@@ -174,7 +150,6 @@ public final class Main {
     }
 
     public static final class ConnectionRequest {
-        public String driver;
         public String jdbcUrl;
         public String username;
         public String password;

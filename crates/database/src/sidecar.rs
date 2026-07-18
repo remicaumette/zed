@@ -1,4 +1,4 @@
-use crate::{ConnectionProfile, DatabaseDriver};
+use crate::{ConnectionProfile, resolve_jdbc_driver_path};
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,6 @@ struct RequestEnvelope<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionRequest<'a> {
-    driver: DatabaseDriver,
     jdbc_url: &'a str,
     username: Option<&'a str>,
     password: Option<&'a str>,
@@ -71,6 +70,9 @@ pub async fn test_connection(
             jar_path.display()
         );
     }
+    let driver_path = resolve_jdbc_driver_path(profile)?;
+    let classpath = std::env::join_paths([jar_path.as_os_str(), driver_path.as_os_str()])
+        .context("building the JDBC sidecar classpath")?;
 
     let request_id = Uuid::new_v4();
     let request = RequestEnvelope {
@@ -78,7 +80,6 @@ pub async fn test_connection(
         request_id,
         operation: "testConnection",
         connection: ConnectionRequest {
-            driver: profile.driver,
             jdbc_url: &profile.jdbc_url,
             username: profile.username.as_deref(),
             password,
@@ -96,8 +97,9 @@ pub async fn test_connection(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("java"));
     let mut child = async_process::Command::new(&java_binary)
-        .arg("-jar")
-        .arg(&jar_path)
+        .arg("-cp")
+        .arg(classpath)
+        .arg("dev.zed.database.sidecar.Main")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -200,6 +202,7 @@ fn sidecar_jar_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DatabaseDriver;
 
     #[test]
     fn request_never_serializes_absent_credentials() {
@@ -209,7 +212,6 @@ mod tests {
             request_id: Uuid::nil(),
             operation: "testConnection",
             connection: ConnectionRequest {
-                driver: profile.driver,
                 jdbc_url: &profile.jdbc_url,
                 username: None,
                 password: None,
@@ -219,7 +221,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"driver\":\"sqlite\""));
+        assert!(!json.contains("\"driver\""));
         assert!(json.contains("\"password\":null"));
         assert!(!json.contains("Local"));
     }
@@ -236,5 +238,35 @@ mod tests {
 
         assert_eq!(result.database_product, "SQLite");
         assert!(database_path.is_file());
+    }
+
+    #[test]
+    #[ignore = "requires Java and a built JDBC sidecar"]
+    fn resolves_all_managed_jdbc_drivers() {
+        let cases = [
+            (
+                DatabaseDriver::PostgreSql,
+                "jdbc:postgresql://127.0.0.1:1/postgres?connectTimeout=1",
+            ),
+            (
+                DatabaseDriver::MySql,
+                "jdbc:mysql://127.0.0.1:1/mysql?connectTimeout=1000",
+            ),
+            (
+                DatabaseDriver::ClickHouse,
+                "jdbc:clickhouse://127.0.0.1:1/default?connection_timeout=1000",
+            ),
+        ];
+
+        for (driver, jdbc_url) in cases {
+            let mut profile = ConnectionProfile::new("Driver test", driver);
+            profile.jdbc_url = jdbc_url.to_owned();
+            let error = smol::block_on(test_connection(&profile, None)).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                !message.contains("No suitable driver"),
+                "{driver} was not resolved: {message}"
+            );
+        }
     }
 }

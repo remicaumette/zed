@@ -14,10 +14,14 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+async-fs.workspace = true
 async-process.workspace = true
 futures.workspace = true
+http_client.workspace = true
+paths.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

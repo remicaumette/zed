@@ -1,12 +1,16 @@
 //! Domain types shared by the database viewer UI and its JDBC sidecar.
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, path::PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod driver_manager;
 mod sidecar;
 
+pub use driver_manager::{
+    JdbcDriverDownload, download_jdbc_driver, installed_jdbc_driver_path, resolve_jdbc_driver_path,
+};
 pub use sidecar::{ConnectionTestResult, test_connection};
 
 /// Version of the serialized connection registry.
@@ -41,12 +45,17 @@ impl fmt::Display for ConnectionId {
 
 /// Drivers supported by the first database viewer milestone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum DatabaseDriver {
+    #[serde(rename = "postgresql", alias = "postgre_sql")]
     PostgreSql,
+    #[serde(rename = "mysql", alias = "my_sql")]
     MySql,
+    #[serde(rename = "clickhouse", alias = "click_house")]
     ClickHouse,
+    #[serde(rename = "sqlite")]
     Sqlite,
+    #[serde(rename = "custom")]
+    Custom,
 }
 
 impl DatabaseDriver {
@@ -56,6 +65,7 @@ impl DatabaseDriver {
             Self::MySql => "MySQL",
             Self::ClickHouse => "ClickHouse",
             Self::Sqlite => "SQLite",
+            Self::Custom => "Custom JDBC",
         }
     }
 
@@ -65,16 +75,12 @@ impl DatabaseDriver {
             Self::MySql => "jdbc:mysql://localhost:3306/mysql",
             Self::ClickHouse => "jdbc:clickhouse://localhost:8123/default",
             Self::Sqlite => "jdbc:sqlite:database.sqlite",
+            Self::Custom => "jdbc:",
         }
     }
 
-    pub fn jdbc_url_prefix(self) -> &'static str {
-        match self {
-            Self::PostgreSql => "jdbc:postgresql:",
-            Self::MySql => "jdbc:mysql:",
-            Self::ClickHouse => "jdbc:clickhouse:",
-            Self::Sqlite => "jdbc:sqlite:",
-        }
+    pub fn download(self) -> Option<JdbcDriverDownload> {
+        driver_manager::download_for_driver(self)
     }
 }
 
@@ -93,17 +99,6 @@ pub enum ConnectionScope {
     Project,
 }
 
-/// Optional environment label used to make risky connections recognizable.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionEnvironment {
-    #[default]
-    Local,
-    Development,
-    Staging,
-    Production,
-}
-
 /// Non-secret settings for a saved connection.
 ///
 /// Passwords and tokens deliberately do not belong here. The UI will store them
@@ -117,11 +112,15 @@ pub struct ConnectionProfile {
     pub jdbc_url: String,
     pub username: Option<String>,
     #[serde(default)]
+    pub custom_driver_path: Option<PathBuf>,
+    #[serde(default = "default_read_only")]
     pub read_only: bool,
     #[serde(default)]
-    pub environment: ConnectionEnvironment,
-    #[serde(default)]
     pub scope: ConnectionScope,
+}
+
+fn default_read_only() -> bool {
+    true
 }
 
 impl ConnectionProfile {
@@ -132,8 +131,8 @@ impl ConnectionProfile {
             driver,
             jdbc_url: driver.default_jdbc_url().to_owned(),
             username: None,
+            custom_driver_path: None,
             read_only: true,
-            environment: ConnectionEnvironment::Local,
             scope: ConnectionScope::Global,
         }
     }
@@ -145,12 +144,14 @@ impl ConnectionProfile {
         if !self.jdbc_url.trim().starts_with("jdbc:") {
             return Err(ConnectionProfileError::InvalidJdbcUrl);
         }
-        if !self
-            .jdbc_url
-            .trim()
-            .starts_with(self.driver.jdbc_url_prefix())
-        {
-            return Err(ConnectionProfileError::DriverUrlMismatch(self.driver));
+        if self.driver == DatabaseDriver::Custom {
+            let path = self
+                .custom_driver_path
+                .as_ref()
+                .ok_or(ConnectionProfileError::MissingCustomDriverPath)?;
+            if !path.is_file() {
+                return Err(ConnectionProfileError::CustomDriverNotFound(path.clone()));
+            }
         }
         Ok(())
     }
@@ -162,8 +163,10 @@ pub enum ConnectionProfileError {
     MissingName,
     #[error("connection URL must start with `jdbc:`")]
     InvalidJdbcUrl,
-    #[error("connection URL does not match the {0} JDBC driver")]
-    DriverUrlMismatch(DatabaseDriver),
+    #[error("a custom JDBC driver JAR is required")]
+    MissingCustomDriverPath,
+    #[error("custom JDBC driver JAR does not exist at `{}`", .0.display())]
+    CustomDriverNotFound(PathBuf),
 }
 
 /// Versioned payload persisted by the database panel.
@@ -237,12 +240,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_read_only_profile_with_driver_default() {
+    fn creates_profile_with_driver_default() {
         let profile = ConnectionProfile::new("Local analytics", DatabaseDriver::ClickHouse);
 
         assert!(profile.read_only);
         assert_eq!(profile.jdbc_url, "jdbc:clickhouse://localhost:8123/default");
         assert_eq!(profile.validate(), Ok(()));
+    }
+
+    #[test]
+    fn driver_storage_names_are_stable_and_accept_legacy_profiles() {
+        let cases = [
+            (DatabaseDriver::PostgreSql, "postgresql", "postgre_sql"),
+            (DatabaseDriver::MySql, "mysql", "my_sql"),
+            (DatabaseDriver::ClickHouse, "clickhouse", "click_house"),
+            (DatabaseDriver::Sqlite, "sqlite", "sqlite"),
+            (DatabaseDriver::Custom, "custom", "custom"),
+        ];
+
+        for (driver, protocol_name, legacy_name) in cases {
+            assert_eq!(
+                serde_json::to_string(&driver).unwrap(),
+                format!("\"{protocol_name}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<DatabaseDriver>(&format!("\"{legacy_name}\"")).unwrap(),
+                driver
+            );
+        }
     }
 
     #[test]
@@ -257,13 +282,22 @@ mod tests {
             Err(ConnectionProfileError::InvalidJdbcUrl)
         );
 
-        profile.jdbc_url = "jdbc:mysql://localhost/mysql".to_owned();
+        profile.jdbc_url = "jdbc:custom://localhost/database".to_owned();
+        assert_eq!(profile.validate(), Ok(()));
+    }
+
+    #[test]
+    fn custom_profiles_require_an_existing_driver_jar() {
+        let mut profile = ConnectionProfile::new("Custom", DatabaseDriver::Custom);
         assert_eq!(
             profile.validate(),
-            Err(ConnectionProfileError::DriverUrlMismatch(
-                DatabaseDriver::PostgreSql
-            ))
+            Err(ConnectionProfileError::MissingCustomDriverPath)
         );
+
+        let driver = tempfile::NamedTempFile::new().unwrap();
+        profile.custom_driver_path = Some(driver.path().to_owned());
+        profile.jdbc_url = "jdbc:custom://localhost/database".to_owned();
+        assert_eq!(profile.validate(), Ok(()));
     }
 
     #[test]
