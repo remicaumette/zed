@@ -236,8 +236,17 @@ impl DatabasePanel {
                 return;
             }
 
+            let project = workspace.project().clone();
             let console = cx.new(|cx| {
-                DatabaseConsole::new(workspace_handle, panel, profile, console, window, cx)
+                DatabaseConsole::new(
+                    workspace_handle,
+                    panel,
+                    project,
+                    profile,
+                    console,
+                    window,
+                    cx,
+                )
             });
             workspace.add_item_to_active_pane(Box::new(console), None, true, window, cx);
         });

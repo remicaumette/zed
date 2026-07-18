@@ -11,6 +11,7 @@ use gpui::{
 };
 use language::Buffer;
 use multi_buffer::{MultiBuffer, MultiBufferOffset};
+use project::Project;
 use std::path::Path;
 use ui::{
     Banner, Button, ButtonStyle, Color, Icon, IconName, Label, LabelSize, Severity, prelude::*,
@@ -42,28 +43,23 @@ impl DatabaseConsole {
     pub(crate) fn new(
         workspace: WeakEntity<Workspace>,
         panel: WeakEntity<DatabasePanel>,
+        project: Entity<Project>,
         profile: ConnectionProfile,
         console: QueryConsole,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let project = workspace
-            .upgrade()
-            .map(|workspace| workspace.read(cx).project().clone());
-        let language_registry = project
-            .as_ref()
-            .map(|project| project.read(cx).languages().clone());
+        let language_registry = project.read(cx).languages().clone();
         let buffer = cx.new(|cx| {
             let buffer = Buffer::local(console.sql.clone(), cx);
-            if let Some(language_registry) = &language_registry {
-                buffer.set_language_registry(language_registry.clone());
-            }
+            buffer.set_language_registry(language_registry.clone());
             buffer
         });
         let multi_buffer = cx
             .new(|cx| MultiBuffer::singleton(buffer.clone(), cx).with_title(console.name.clone()));
         let editor = cx.new(|cx| {
-            let mut editor = Editor::new(EditorMode::full(), multi_buffer, project, window, cx);
+            let mut editor =
+                Editor::new(EditorMode::full(), multi_buffer, Some(project), window, cx);
             editor.set_placeholder_text("Write one or more SQL statements…", window, cx);
             editor.set_show_runnables(false, cx);
             editor.set_use_modal_editing(true);
@@ -83,20 +79,16 @@ impl DatabaseConsole {
         });
 
         let console_name = console.name.clone();
-        let language_task = if let Some(language_registry) = language_registry {
-            let language_path = console.name.clone();
-            cx.spawn(async move |_, cx| {
-                let Ok(language) = language_registry
-                    .load_language_for_file_path(Path::new(&language_path))
-                    .await
-                else {
-                    return;
-                };
-                buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
-            })
-        } else {
-            Task::ready(())
-        };
+        let language_path = console.name.clone();
+        let language_task = cx.spawn(async move |_, cx| {
+            let Ok(language) = language_registry
+                .load_language_for_file_path(Path::new(&language_path))
+                .await
+            else {
+                return;
+            };
+            buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+        });
 
         Self {
             workspace,
