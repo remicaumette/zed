@@ -417,6 +417,21 @@ pub mod project_panel {
         ]
     );
 }
+
+pub mod database_panel {
+    use gpui::actions;
+
+    actions!(
+        database_panel,
+        [
+            /// Toggles the database panel.
+            Toggle,
+            /// Toggles focus on the database panel.
+            ToggleFocus
+        ]
+    );
+}
+
 pub mod feedback {
     use gpui::actions;
 

@@ -222,6 +222,7 @@
   - [Windows](./development/windows.md)
   - [FreeBSD](./development/freebsd.md)
   - [Using Debuggers](./development/debuggers.md)
+  - [Database Viewer Project](./development/database-viewer.md)
   - [Performance](./performance.md)
   - [Glossary](./development/glossary.md)
 - [Release Notes](./development/release-notes.md)
