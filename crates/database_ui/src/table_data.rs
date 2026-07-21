@@ -1081,7 +1081,9 @@ impl TableDataView {
                                 .color(Color::Muted),
                         }
                     }
-                    .when(row.deleted, |label| label.strikethrough());
+                    .when(row.deleted, |label| label.strikethrough())
+                    .single_line()
+                    .truncate();
                     let cell = div()
                         .id((
                             "table-data-cell",
@@ -1110,7 +1112,16 @@ impl TableDataView {
                                 },
                             ))
                         })
-                        .child(div().size_full().px_1().child(label))
+                        .child(
+                            div()
+                                .size_full()
+                                .min_w_0()
+                                .px_1()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .overflow_hidden()
+                                .child(label),
+                        )
                         .into_any_element();
 
                     let relation_available = self
